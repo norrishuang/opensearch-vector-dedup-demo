@@ -1,9 +1,14 @@
-# OpenSearch Vector Dedup — Test Demo
+# Vector Dedup — Test Demo（OpenSearch / RDS PostgreSQL）
 
-在 **Amazon OpenSearch Service** 上验证"顺序批量向量去重"方案的测试程序。
+验证"顺序批量向量去重"方案的测试程序，**同时支持两种向量引擎**：
+
+- **Amazon OpenSearch Service**（Faiss HNSW kNN）
+- **Amazon RDS for PostgreSQL + pgvector**（HNSW cosine）
+
 生成模拟的 768 维视频 Embedding 向量，用 **numpy 矩阵乘法做本地去重**，再通过
-`_msearch` 径向检索 + `_bulk` 写入的顺序批量循环，把去重后的唯一向量写入 OpenSearch。
-自带 **1 亿（100M）级别**压测能力与**去重准确率**评估。
+"径向检索 → 批量写入 → 刷新"的顺序批量循环，把去重后的唯一向量写入所选引擎。
+自带 **1 亿（100M）级别**压测能力与**去重准确率**评估。用 `--backend` 一键切换引擎，
+其余流程与统计完全一致，方便横向对比两种引擎的吞吐与准确率。
 
 > 方案背景：视频训练集去重 —— 把视频编码为 768 维 FP32 归一化向量，移除余弦相似度
 > ≥ 0.95 的近重复。核心是"单 Worker 顺序批量"，用批次间的刷新等待消除并行方案的
@@ -16,9 +21,10 @@
 - **流式数据生成**：不一次性占满内存，逐批生成归一化向量，支持 1 亿+ 规模。
 - **可控近重复 + 真值标注**：每个向量带 `group_id`，同组即近重复，用于精确测算去重准确率（泄漏的重复数）。
 - **numpy 本地去重**：`batch @ batch.T` 一次算出批内全部两两余弦相似度，精确且高效；大批量自动切换分块变体控制内存。
-- **顺序批量循环**：本地去重 → `_msearch`（20×1K 并行）→ `_bulk`（4×5K 并行）→ 等待刷新，完全对齐方案设计。
-- **Dry-run 模式**：无需 OpenSearch 集群，用真值 oracle 验证整条流水线与准确率逻辑。
-- **两种鉴权**：Basic Auth（自建/细粒度访问控制）与 AWS SigV4（托管 Amazon OpenSearch Service / Serverless）。
+- **双引擎可插拔**：`--backend opensearch` 或 `--backend pgvector`，同一套流程与统计，方便横向对比。
+- **顺序批量循环**：本地去重 → 径向检索（并行）→ 批量写入（并行）→ 刷新，完全对齐方案设计。
+- **Dry-run 模式**：无需任何集群/数据库，用真值 oracle 验证整条流水线与准确率逻辑。
+- **多种鉴权**：OpenSearch 支持 Basic Auth 与 AWS SigV4；PostgreSQL 支持标准连接 + SSL（RDS 默认）。
 
 ---
 
@@ -31,8 +37,10 @@ opensearch-vector-dedup-demo/
 │   ├── config.py           # 所有可调参数（支持环境变量 / CLI 覆盖）
 │   ├── data_generator.py   # 流式模拟向量生成 + 真值 group_id
 │   ├── local_dedup.py      # numpy 矩阵乘法本地去重（含分块变体）
-│   ├── os_client.py        # OpenSearch 客户端：建索引 / _msearch / _bulk / refresh
-│   └── dedup_runner.py     # 顺序批量主循环 + 吞吐/准确率统计
+│   ├── backend_base.py     # 向量后端统一接口（VectorBackend）
+│   ├── os_client.py        # OpenSearch 后端：建索引 / _msearch / _bulk / refresh
+│   ├── pg_client.py        # PostgreSQL + pgvector 后端：建表 / HNSW / 检索 / 写入
+│   └── dedup_runner.py     # 顺序批量主循环 + 后端工厂 + 吞吐/准确率统计
 ├── tests/test_dedup.py     # 单元测试（本地去重正确性 + dry-run 零泄漏）
 ├── requirements.txt
 ├── LICENSE                 # MIT
@@ -106,12 +114,49 @@ python run_dedup.py --total 100000000 --batch-size 20000
 
 > 程序启动时会 **删除并重建** 目标索引（默认 `video_vectors`），请勿指向生产索引。
 
+### 4. 连接 RDS PostgreSQL（pgvector）跑压测
+
+先确认 RDS 实例已启用 `vector` 扩展（程序会自动执行 `CREATE EXTENSION IF NOT EXISTS vector`，
+需要账号有相应权限；RDS PostgreSQL 15+ 原生支持 pgvector）。
+
+```bash
+export BACKEND=pgvector
+export PG_HOST=your-instance.xxxxx.us-west-2.rds.amazonaws.com
+export PG_PORT=5432
+export PG_DB=vectordb
+export PG_USER=postgres
+export PG_PASSWORD='your-password'
+export PG_SSLMODE=require          # RDS 默认要求 SSL
+
+python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
+```
+
+> 程序启动时会 **DROP 并重建** 目标表（默认 `video_vectors`）及其 HNSW cosine 索引，请勿指向生产表。
+
+---
+
+## 两种引擎对照
+
+| 维度 | OpenSearch | PostgreSQL + pgvector |
+|---|---|---|
+| 向量索引 | Faiss HNSW | pgvector HNSW |
+| 相似度 | innerproduct（`min_score=1.95`，需归一化） | cosine 距离 `<=>`（`dist <= 0.05`） |
+| 一致性 | 近实时（写入后需 ~1s 刷新） | 事务一致（commit 后立即可见，无需等待） |
+| 检索 | `_msearch` 并行分块 | `unnest + LATERAL` 每块一次往返，线程池并行 |
+| 写入 | `_bulk` 并行分块 | `execute_values` 批量 INSERT，线程池并行 |
+| 建库参数 | m=16, ef_construction=128, ef_search=256 | 同名参数（`PG_HNSW_*`） |
+
+> 因 PostgreSQL 是事务一致的，pgvector 后端**不需要** OpenSearch 那样的批间刷新等待，
+> 单批周期通常更短；但大规模下 HNSW 索引维护开销与 OpenSearch 分布式扩展性各有取舍，
+> 正是本 demo 想帮你实测对比的点。
+
 ---
 
 ## 命令行参数
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
+| `--backend` | 向量引擎：`opensearch` 或 `pgvector` | opensearch |
 | `--total` | 处理的向量总数 | 100,000,000（1 亿） |
 | `--batch-size` | 每批向量数 | 20,000 |
 | `--dup-ratio` | 注入近重复的比例 | 0.30 |
@@ -127,6 +172,7 @@ python run_dedup.py --total 100000000 --batch-size 20000
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
+| `BACKEND` | 向量引擎：opensearch / pgvector | opensearch |
 | `OS_HOST` / `OS_PORT` | OpenSearch 端点 | localhost / 443 |
 | `OS_USERNAME` / `OS_PASSWORD` | Basic Auth 凭据 | 空 |
 | `OS_USE_AWS_AUTH` | 是否用 SigV4 | false |
@@ -136,8 +182,13 @@ python run_dedup.py --total 100000000 --batch-size 20000
 | `BATCH_SIZE` | 批大小 | 20000 |
 | `MSEARCH_CHUNK` / `BULK_CHUNK` | 检索/写入分块大小 | 1000 / 5000 |
 | `MSEARCH_WORKERS` / `BULK_WORKERS` | 检索/写入并行度 | 20 / 4 |
-| `REFRESH_WAIT_S` | 每批后等待刷新秒数 | 1.0 |
+| `REFRESH_WAIT_S` | 每批后等待刷新秒数（仅 OpenSearch） | 1.0 |
 | `NEAR_DUP_SIM` | 注入近重复的余弦相似度（越低越难） | 0.99 |
+| `PG_HOST` / `PG_PORT` | RDS PostgreSQL 端点 | localhost / 5432 |
+| `PG_DB` / `PG_USER` / `PG_PASSWORD` | 数据库 / 用户 / 密码 | vectordb / postgres / 空 |
+| `PG_SSLMODE` | SSL 模式（RDS 建议 require） | require |
+| `PG_TABLE` | 表名 | video_vectors |
+| `PG_HNSW_M` / `PG_HNSW_EF_CONSTRUCTION` / `PG_HNSW_EF_SEARCH` | pgvector HNSW 参数 | 16 / 128 / 256 |
 
 ---
 

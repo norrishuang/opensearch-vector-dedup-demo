@@ -13,6 +13,7 @@ import numpy as np
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
 
 from .config import Config
+from .backend_base import VectorBackend
 
 
 def build_client(cfg: Config) -> OpenSearch:
@@ -43,12 +44,23 @@ def build_client(cfg: Config) -> OpenSearch:
     )
 
 
-class DedupIndex:
+class DedupIndex(VectorBackend):
     """Operations against a single kNN index for the dedup loop."""
 
     def __init__(self, cfg: Config, client: OpenSearch | None = None):
         self.cfg = cfg
         self.client = client or build_client(cfg)
+
+    # ---- VectorBackend interface ----
+    def setup(self) -> None:
+        self.recreate_index()
+        try:
+            self.tune_circuit_breaker("75%")
+        except Exception as e:  # non-fatal on serverless / limited perms
+            print(f"[warn] could not set circuit breaker: {e}")
+
+    def needs_refresh_wait(self) -> bool:
+        return True  # OpenSearch is near-real-time
 
     # ---- index lifecycle ----
     def recreate_index(self) -> None:

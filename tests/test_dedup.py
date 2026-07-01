@@ -50,6 +50,24 @@ def test_generator_unique_group_count():
     assert len(seen) == gen.unique_groups
 
 
+def test_pg_vector_literal():
+    from src.pg_client import _vec_literal
+    v = np.array([0.5, -0.25, 1.0], dtype=np.float32)
+    assert _vec_literal(v) == "[0.5,-0.25,1]"
+
+
+def test_backend_factory_selection():
+    from src.dedup_runner import _build_backend  # noqa
+    # unknown backend should raise a clear error (no connection attempted)
+    cfg = Config()
+    cfg.backend = "does-not-exist"
+    try:
+        _build_backend(cfg)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "unknown backend" in str(e)
+
+
 def test_dry_run_zero_leaks():
     cfg = Config()
     cfg.dry_run = True
@@ -69,5 +87,7 @@ if __name__ == "__main__":
     test_local_dedup_removes_exact_copies()
     test_local_dedup_blocked_matches_dense()
     test_generator_unique_group_count()
+    test_pg_vector_literal()
+    test_backend_factory_selection()
     test_dry_run_zero_leaks()
     print("All tests passed.")

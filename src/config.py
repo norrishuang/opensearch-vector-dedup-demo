@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Config:
+    # ---- Backend selection ----
+    # "opensearch" (Faiss HNSW kNN) or "pgvector" (RDS PostgreSQL + pgvector)
+    backend: str = os.getenv("BACKEND", "opensearch")
+
     # ---- OpenSearch connection ----
     host: str = os.getenv("OS_HOST", "localhost")
     port: int = int(os.getenv("OS_PORT", "443"))
@@ -46,6 +50,19 @@ class Config:
     msearch_workers: int = int(os.getenv("MSEARCH_WORKERS", "20"))
     bulk_workers: int = int(os.getenv("BULK_WORKERS", "4"))
     refresh_wait_s: float = float(os.getenv("REFRESH_WAIT_S", "1.0"))
+
+    # ---- PostgreSQL / pgvector connection (RDS) ----
+    pg_host: str = os.getenv("PG_HOST", "localhost")
+    pg_port: int = int(os.getenv("PG_PORT", "5432"))
+    pg_db: str = os.getenv("PG_DB", "vectordb")
+    pg_user: str = os.getenv("PG_USER", "postgres")
+    pg_password: str = os.getenv("PG_PASSWORD", "")
+    pg_sslmode: str = os.getenv("PG_SSLMODE", "require")  # RDS defaults to SSL
+    pg_table: str = os.getenv("PG_TABLE", "video_vectors")
+    # pgvector HNSW build params (analogous to OpenSearch m / ef_construction)
+    pg_hnsw_m: int = int(os.getenv("PG_HNSW_M", "16"))
+    pg_hnsw_ef_construction: int = int(os.getenv("PG_HNSW_EF_CONSTRUCTION", "128"))
+    pg_hnsw_ef_search: int = int(os.getenv("PG_HNSW_EF_SEARCH", "256"))
 
     # ---- Test data generation ----
     total_vectors: int = int(os.getenv("TOTAL_VECTORS", "100000000"))  # 1亿

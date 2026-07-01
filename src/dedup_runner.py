@@ -96,18 +96,10 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
     oracle = None
     if cfg.dry_run:
         oracle = _OracleIndex()
-        print("[dry-run] no OpenSearch; using ground-truth oracle index")
+        print("[dry-run] no backend; using ground-truth oracle index")
     else:
-        # imported lazily so numpy-only dry-runs need no opensearch-py
-        from .os_client import DedupIndex
-        index = DedupIndex(cfg)
-        print(f"[live] connecting to {cfg.host}:{cfg.port}, recreating index "
-              f"'{cfg.index_name}'")
-        index.recreate_index()
-        try:
-            index.tune_circuit_breaker("75%")
-        except Exception as e:  # non-fatal on serverless / limited perms
-            print(f"[warn] could not set circuit breaker: {e}")
+        index = _build_backend(cfg)
+        index.setup()
 
     t0 = time.time()
     for batch in gen.batches(cfg.batch_size):
@@ -148,9 +140,9 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
             stats.indexed += len(final_vecs)
         else:
             stats.indexed += index.index_survivors(final_vecs, final_ids)
-            # 4) wait for refresh so next batch sees these vectors
+            # 4) make writes visible to the next batch
             index.refresh()
-            if cfg.refresh_wait_s:
+            if index.needs_refresh_wait() and cfg.refresh_wait_s:
                 time.sleep(cfg.refresh_wait_s)
 
         stats.elapsed_s = time.time() - t0
@@ -159,4 +151,25 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
                   f"| indexed {stats.indexed:>12,} | {stats.vps:,.0f} vec/s")
 
     stats.elapsed_s = time.time() - t0
+    if index is not None and hasattr(index, "close"):
+        index.close()
     return stats
+
+
+def _build_backend(cfg: Config):
+    """Instantiate the configured vector backend.
+
+    Imports are lazy so a run only needs the driver for the chosen engine
+    (e.g. pgvector runs don't require opensearch-py, and vice versa).
+    """
+    backend = cfg.backend.lower()
+    if backend in ("opensearch", "os"):
+        from .os_client import DedupIndex
+        print(f"[live] OpenSearch {cfg.host}:{cfg.port}, index '{cfg.index_name}'")
+        return DedupIndex(cfg)
+    if backend in ("pgvector", "postgres", "postgresql", "pg", "rds"):
+        from .pg_client import PgVectorIndex
+        print(f"[live] PostgreSQL {cfg.pg_host}:{cfg.pg_port}/{cfg.pg_db}, "
+              f"table '{cfg.pg_table}'")
+        return PgVectorIndex(cfg)
+    raise ValueError(f"unknown backend '{cfg.backend}' (use 'opensearch' or 'pgvector')")
