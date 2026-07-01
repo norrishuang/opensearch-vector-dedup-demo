@@ -104,14 +104,42 @@ class PgVectorIndex(VectorBackend):
         return False  # PostgreSQL is read-your-writes after commit
 
     # ---- radial search (is-duplicate check) ----
-    def _match_chunk(self, chunk: np.ndarray) -> list[bool]:
+    def _match_chunk_single(self, chunk: np.ndarray) -> list[bool]:
+        """Per-vector kNN queries. Each ``ORDER BY embedding <=> $1 LIMIT 1``
+        uses a bound parameter, so pgvector CAN use the HNSW index. Round trips
+        are amortized on one pooled connection; DB-side parallelism comes from
+        running many chunks (connections) concurrently in the thread pool.
+        """
+        conn = self._conn()
+        try:
+            out = [False] * len(chunk)
+            sql = (
+                f"SELECT embedding <=> %s::vector AS dist "
+                f"FROM {self.cfg.pg_table} "
+                f"ORDER BY embedding <=> %s::vector LIMIT 1"
+            )
+            with conn.cursor() as cur:
+                cur.execute(f"SET hnsw.ef_search = {self.cfg.pg_hnsw_ef_search};")
+                for i, v in enumerate(chunk):
+                    lit = _vec_literal(v)
+                    cur.execute(sql, (lit, lit))
+                    row = cur.fetchone()
+                    out[i] = (row is not None and row[0] is not None
+                              and row[0] <= self.threshold_distance)
+            return out
+        finally:
+            self.pool.putconn(conn)
+
+    def _match_chunk_lateral(self, chunk: np.ndarray) -> list[bool]:
+        """Batch many vectors in one round trip via LATERAL. Fewer round trips,
+        but the correlated ORDER BY may not use the HNSW index (can seq-scan).
+        Kept for A/B comparison; not the default.
+        """
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(f"SET hnsw.ef_search = {self.cfg.pg_hnsw_ef_search};")
                 literals = [_vec_literal(v) for v in chunk]
-                # One round trip: nearest-neighbor distance per query vector.
-                # LEFT JOIN LATERAL so empty table still returns a row (NULL dist).
                 sql = (
                     "SELECT q.ord, n.dist "
                     "FROM unnest(%s::text[]) WITH ORDINALITY AS q(vt, ord) "
@@ -132,6 +160,11 @@ class PgVectorIndex(VectorBackend):
         finally:
             self.pool.putconn(conn)
 
+    def _match_chunk(self, chunk: np.ndarray) -> list[bool]:
+        if self.cfg.pg_query_mode == "lateral":
+            return self._match_chunk_lateral(chunk)
+        return self._match_chunk_single(chunk)
+
     def find_matches(self, vectors: np.ndarray) -> np.ndarray:
         if len(vectors) == 0:
             return np.zeros(0, dtype=bool)
@@ -140,6 +173,27 @@ class PgVectorIndex(VectorBackend):
         with ThreadPoolExecutor(max_workers=self.cfg.msearch_workers) as ex:
             results = list(ex.map(self._match_chunk, chunks))
         return np.array([b for r in results for b in r], dtype=bool)
+
+    def explain_search(self) -> str:
+        """Return the EXPLAIN plan for one kNN dedup query, to verify the HNSW
+        index is actually used (look for 'Index Scan using ...hnsw')."""
+        import numpy as _np
+        v = _np.zeros(self.cfg.dimension, dtype=_np.float32)
+        v[0] = 1.0
+        lit = _vec_literal(v)
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET hnsw.ef_search = {self.cfg.pg_hnsw_ef_search};")
+                cur.execute(
+                    f"EXPLAIN SELECT embedding <=> %s::vector AS dist "
+                    f"FROM {self.cfg.pg_table} "
+                    f"ORDER BY embedding <=> %s::vector LIMIT 1",
+                    (lit, lit),
+                )
+                return "\n".join(r[0] for r in cur.fetchall())
+        finally:
+            self.pool.putconn(conn)
 
     # ---- bulk insert (survivors) ----
     def _insert_chunk(self, chunk_vecs: np.ndarray, chunk_ids) -> int:

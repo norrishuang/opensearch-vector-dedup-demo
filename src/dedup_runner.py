@@ -35,6 +35,11 @@ class Stats:
     indexed: int = 0             # written to the index (survivors)
     batches: int = 0
     elapsed_s: float = 0.0
+    # per-phase cumulative seconds (to locate the real bottleneck)
+    t_local: float = 0.0          # local numpy dedup
+    t_search: float = 0.0         # radial search (is-duplicate check)
+    t_index: float = 0.0          # bulk write / insert
+    t_refresh: float = 0.0        # refresh + refresh wait
     # ground-truth accounting
     groups_seen: set = field(default_factory=set)
     leaked_dups: int = 0          # a group indexed more than once
@@ -46,6 +51,8 @@ class Stats:
 
     def summary(self) -> dict:
         unique_truth = len(self.groups_seen)
+        total_phase = self.t_local + self.t_search + self.t_index + self.t_refresh
+        pct = lambda t: round(100.0 * t / total_phase, 1) if total_phase else 0.0
         return {
             "processed": self.processed,
             "indexed": self.indexed,
@@ -54,6 +61,18 @@ class Stats:
             "batches": self.batches,
             "elapsed_s": round(self.elapsed_s, 2),
             "throughput_vps": round(self.vps, 1),
+            "phase_seconds": {
+                "local_dedup": round(self.t_local, 2),
+                "search": round(self.t_search, 2),
+                "index_write": round(self.t_index, 2),
+                "refresh": round(self.t_refresh, 2),
+            },
+            "phase_pct": {
+                "local_dedup": pct(self.t_local),
+                "search": pct(self.t_search),
+                "index_write": pct(self.t_index),
+                "refresh": pct(self.t_refresh),
+            },
             "ground_truth_unique": unique_truth,
             "leaked_duplicates": self.leaked_dups,
             "accuracy_pct": round(
@@ -100,6 +119,16 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
     else:
         index = _build_backend(cfg)
         index.setup()
+        # verify the vector index is actually used (diagnose seq-scan slowness)
+        if hasattr(index, "explain_search"):
+            try:
+                plan = index.explain_search()
+                uses_idx = "hnsw" in plan.lower() and "index scan" in plan.lower()
+                print(f"[diag] search plan {'USES HNSW index' if uses_idx else 'does NOT use index (!)'}:")
+                for line in plan.splitlines():
+                    print(f"       {line}")
+            except Exception as e:
+                print(f"[warn] EXPLAIN failed: {e}")
 
     t0 = time.time()
     for batch in gen.batches(cfg.batch_size):
@@ -108,18 +137,22 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
         stats.groups_seen.update(int(g) for g in batch.group_ids)
 
         # 1) local dedup (exact, intra-batch)
+        ts = time.time()
         dedup_fn = _pick_local_dedup(len(batch.vectors))
         keep = dedup_fn(batch.vectors, cfg.cosine_threshold)
+        stats.t_local += time.time() - ts
         stats.local_discarded += int((~keep).sum())
         surv_vecs = batch.vectors[keep]
         surv_ids = batch.ids[keep]
         surv_groups = batch.group_ids[keep]
 
         # 2) radial search survivors against the index
+        ts = time.time()
         if cfg.dry_run:
             matched = oracle.find_matches_by_group(surv_groups)
         else:
             matched = index.find_matches(surv_vecs)
+        stats.t_search += time.time() - ts
         stats.os_discarded += int(matched.sum())
 
         final_vecs = surv_vecs[~matched]
@@ -139,11 +172,15 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
             oracle.add_groups(final_groups)
             stats.indexed += len(final_vecs)
         else:
+            ts = time.time()
             stats.indexed += index.index_survivors(final_vecs, final_ids)
+            stats.t_index += time.time() - ts
             # 4) make writes visible to the next batch
+            ts = time.time()
             index.refresh()
             if index.needs_refresh_wait() and cfg.refresh_wait_s:
                 time.sleep(cfg.refresh_wait_s)
+            stats.t_refresh += time.time() - ts
 
         stats.elapsed_s = time.time() - t0
         if stats.batches % progress_every == 0:

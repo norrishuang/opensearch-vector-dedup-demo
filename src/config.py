@@ -62,7 +62,15 @@ class Config:
     # pgvector HNSW build params (analogous to OpenSearch m / ef_construction)
     pg_hnsw_m: int = int(os.getenv("PG_HNSW_M", "16"))
     pg_hnsw_ef_construction: int = int(os.getenv("PG_HNSW_EF_CONSTRUCTION", "128"))
-    pg_hnsw_ef_search: int = int(os.getenv("PG_HNSW_EF_SEARCH", "256"))
+    # Dedup only needs "is the nearest neighbor closer than threshold?", not a
+    # high-precision Top-K, so ef_search can be much lower than for ranking.
+    pg_hnsw_ef_search: int = int(os.getenv("PG_HNSW_EF_SEARCH", "128"))
+    # Radial-search query mode:
+    #   "single"  -> one indexed kNN query per vector (bound param, uses HNSW)
+    #   "lateral" -> batch many vectors in one round trip via LATERAL join
+    #                (fewer round trips, but the correlated ORDER BY may NOT
+    #                 use the HNSW index -> can degrade to a seq scan)
+    pg_query_mode: str = os.getenv("PG_QUERY_MODE", "single")
     # HNSW index build is memory-sensitive: if the graph doesn't fit in
     # maintenance_work_mem it spills to disk and build slows dramatically.
     # Raised per-session before creating the index. Empty => leave RDS default.
