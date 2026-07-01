@@ -103,7 +103,7 @@ def _pick_local_dedup(n: int):
     return local_dedup if n <= 10_000 else local_dedup_blocked
 
 
-def run(cfg: Config, progress_every: int = 10) -> Stats:
+def run(cfg: Config, progress_every: int = 10, report_every_batch: bool = False) -> Stats:
     gen = VectorGenerator(
         total=cfg.total_vectors, dim=cfg.dimension,
         dup_ratio=cfg.duplicate_ratio, near_dup_sim=cfg.near_dup_sim,
@@ -135,6 +135,11 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
         stats.batches += 1
         stats.processed += len(batch.vectors)
         stats.groups_seen.update(int(g) for g in batch.group_ids)
+
+        # snapshot cumulative phase times to compute this batch's deltas
+        b_t0 = time.time()
+        snap_local, snap_search = stats.t_local, stats.t_search
+        snap_index, snap_refresh = stats.t_index, stats.t_refresh
 
         # 1) local dedup (exact, intra-batch)
         ts = time.time()
@@ -183,7 +188,18 @@ def run(cfg: Config, progress_every: int = 10) -> Stats:
             stats.t_refresh += time.time() - ts
 
         stats.elapsed_s = time.time() - t0
-        if stats.batches % progress_every == 0:
+        if report_every_batch:
+            d_local = stats.t_local - snap_local
+            d_search = stats.t_search - snap_search
+            d_index = stats.t_index - snap_index
+            d_refresh = stats.t_refresh - snap_refresh
+            d_total = time.time() - b_t0
+            n = len(batch.vectors)
+            print(f"  batch {stats.batches:>6} | n={n:>6,} "
+                  f"| local {d_local:6.2f}s  search {d_search:6.2f}s  "
+                  f"write {d_index:6.2f}s  refresh {d_refresh:6.2f}s "
+                  f"| batch {d_total:6.2f}s | idx_total {stats.indexed:>12,}")
+        elif stats.batches % progress_every == 0:
             print(f"  batch {stats.batches:>6} | processed {stats.processed:>12,} "
                   f"| indexed {stats.indexed:>12,} | {stats.vps:,.0f} vec/s")
 

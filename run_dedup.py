@@ -39,6 +39,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="skip OpenSearch; use ground-truth oracle to validate the pipeline")
     p.add_argument("--seed", type=int, help="RNG seed (default 42)")
     p.add_argument("--progress-every", type=int, default=10, help="print progress every N batches")
+    p.add_argument("--report-every-batch", action="store_true",
+                   help="print per-batch phase timing (local/search/write/refresh) to spot "
+                        "whether search or insert cost grows as the index fills up")
     return p.parse_args(argv)
 
 
@@ -81,7 +84,8 @@ def main(argv=None) -> int:
             print(f"  table         : {cfg.pg_table}")
     print("-" * 68)
 
-    stats = run(cfg, progress_every=args.progress_every)
+    stats = run(cfg, progress_every=args.progress_every,
+                report_every_batch=args.report_every_batch)
 
     print("=" * 68)
     print("RESULT")
