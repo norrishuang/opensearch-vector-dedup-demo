@@ -127,6 +127,7 @@ export PG_DB=vectordb
 export PG_USER=postgres
 export PG_PASSWORD='your-password'
 export PG_SSLMODE=require          # RDS 默认要求 SSL
+export PG_MAINTENANCE_WORK_MEM=4GB # 建 HNSW 索引内存，越大越快（见调优章节）
 
 python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
 ```
@@ -149,6 +150,46 @@ python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
 > 因 PostgreSQL 是事务一致的，pgvector 后端**不需要** OpenSearch 那样的批间刷新等待，
 > 单批周期通常更短；但大规模下 HNSW 索引维护开销与 OpenSearch 分布式扩展性各有取舍，
 > 正是本 demo 想帮你实测对比的点。
+
+---
+
+## pgvector 建索引内存调优（重要）
+
+pgvector 的 **HNSW 索引构建对内存极其敏感**。构建时整个图会尽量放进
+`maintenance_work_mem`；**一旦放不下就会 spill 到磁盘，构建速度会下降一个数量级甚至更多**。
+本 demo 采用"先建空索引、随插入增量维护"的方式，插入阶段同样受此参数影响。
+
+### 关键参数
+
+| 参数 | 作用 | 建议 |
+|---|---|---|
+| `maintenance_work_mem` | 建/维护索引可用内存 | 尽量大：单次构建建议 2–8 GB（本 demo 默认 `PG_MAINTENANCE_WORK_MEM=2GB`） |
+| `max_parallel_maintenance_workers` | 并行建索引的 worker 数 | 多核实例可设 2–4，加速构建（`PG_MAX_PARALLEL_MAINT_WORKERS`） |
+| `work_mem` | 查询排序/哈希内存 | 检索并发高时适当调大 |
+| `shared_buffers` | 缓存热数据（含索引页） | 建议 ≈ 实例内存的 25% |
+
+程序会在建索引前按 `PG_MAINTENANCE_WORK_MEM` / `PG_MAX_PARALLEL_MAINT_WORKERS`
+**自动执行 `SET`（会话级）**，并打印实际生效值；权限不足时告警但不中断。
+
+### RDS 上如何设置
+
+- **会话级（本 demo 已自动做）**：`SET maintenance_work_mem = '4GB';` —— 立即生效，只影响当前连接，无需重启。
+- **实例级（更彻底）**：通过 **RDS 参数组（Parameter Group）** 修改 `maintenance_work_mem`、
+  `max_parallel_maintenance_workers`、`shared_buffers` 等，然后关联到实例。
+  注意：`maintenance_work_mem` 在 RDS 参数组里单位是 **KB**，例如 `4GB` 填 `4194304`。
+- **内存要留足**：`maintenance_work_mem × 并行 worker 数` 不能超过实例可用内存，否则可能 OOM。
+  实例内存不足时，宁可调小并行度也别让它 spill。
+
+### 经验值参考
+
+| 数据规模 | 建议 `maintenance_work_mem` | 说明 |
+|---|---|---|
+| 百万级 | 1–2 GB | 一般够用 |
+| 千万级 | 4–8 GB | 强烈建议调大，否则明显变慢 |
+| 亿级 | 8 GB+ 且配合大内存实例 | 关注 spill 与整体内存预算；必要时分区/分表 |
+
+> 小贴士：构建期间可用 `EXPLAIN` 或观察 `pg_stat_progress_create_index` 查看进度；
+> 若发现构建异常慢，多半是 `maintenance_work_mem` 不足导致 spill。
 
 ---
 
@@ -189,6 +230,8 @@ python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
 | `PG_SSLMODE` | SSL 模式（RDS 建议 require） | require |
 | `PG_TABLE` | 表名 | video_vectors |
 | `PG_HNSW_M` / `PG_HNSW_EF_CONSTRUCTION` / `PG_HNSW_EF_SEARCH` | pgvector HNSW 参数 | 16 / 128 / 256 |
+| `PG_MAINTENANCE_WORK_MEM` | 建 HNSW 索引的内存（越大越快，见调优） | 2GB |
+| `PG_MAX_PARALLEL_MAINT_WORKERS` | 建索引并行 worker 数（0=服务器默认） | 0 |
 
 ---
 

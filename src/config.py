@@ -63,6 +63,13 @@ class Config:
     pg_hnsw_m: int = int(os.getenv("PG_HNSW_M", "16"))
     pg_hnsw_ef_construction: int = int(os.getenv("PG_HNSW_EF_CONSTRUCTION", "128"))
     pg_hnsw_ef_search: int = int(os.getenv("PG_HNSW_EF_SEARCH", "256"))
+    # HNSW index build is memory-sensitive: if the graph doesn't fit in
+    # maintenance_work_mem it spills to disk and build slows dramatically.
+    # Raised per-session before creating the index. Empty => leave RDS default.
+    pg_maintenance_work_mem: str = os.getenv("PG_MAINTENANCE_WORK_MEM", "2GB")
+    # Parallel workers for the index build (0 => leave server default).
+    pg_max_parallel_maintenance_workers: int = int(
+        os.getenv("PG_MAX_PARALLEL_MAINT_WORKERS", "0"))
 
     # ---- Test data generation ----
     total_vectors: int = int(os.getenv("TOTAL_VECTORS", "100000000"))  # 1亿

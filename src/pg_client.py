@@ -67,6 +67,28 @@ class PgVectorIndex(VectorBackend):
                     f"  embedding vector({cfg.dimension})"
                     f");"
                 )
+                # --- HNSW build tuning (memory-sensitive) ---
+                # If the graph exceeds maintenance_work_mem, pgvector spills to
+                # disk and the build slows by orders of magnitude. Raise it and
+                # (optionally) enable parallel index-build workers per session.
+                if cfg.pg_maintenance_work_mem:
+                    try:
+                        cur.execute(
+                            f"SET maintenance_work_mem = '{cfg.pg_maintenance_work_mem}';")
+                        print(f"[pg] maintenance_work_mem = "
+                              f"{cfg.pg_maintenance_work_mem}")
+                    except Exception as e:
+                        print(f"[warn] could not set maintenance_work_mem: {e}")
+                if cfg.pg_max_parallel_maintenance_workers > 0:
+                    try:
+                        cur.execute(
+                            f"SET max_parallel_maintenance_workers = "
+                            f"{cfg.pg_max_parallel_maintenance_workers};")
+                        print(f"[pg] max_parallel_maintenance_workers = "
+                              f"{cfg.pg_max_parallel_maintenance_workers}")
+                    except Exception as e:
+                        print(f"[warn] could not set parallel maint workers: {e}")
+
                 # HNSW index for cosine distance (built empty; maintained on insert)
                 cur.execute(
                     f"CREATE INDEX ON {cfg.pg_table} "
