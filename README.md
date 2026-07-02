@@ -154,6 +154,80 @@ python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
 
 ---
 
+## OpenSearch kNN 边写边查调优（最佳实践）
+
+"边写边查、索引持续增长"是这个去重场景的固有模式。默认配置下，随着索引变大，
+`search` 阶段会明显变慢。以下是实测验证过的调优要点，本 demo 的默认值已按最佳实践设置。
+
+### 1. 关闭周期性自动刷新，只靠每批显式 refresh 保证可见性
+
+**问题**：`refresh_interval` 默认 `1s` 时，一批约 25 秒的 `search`+`write` 期间，后台会触发
+约 25 次自动刷新，**每次刷新都切出一个新 segment**。而 Faiss/Lucene 的 HNSW 图是
+**按 segment 独立存在**的——一次 kNN 查询要遍历**每一个 segment 的小图**。segment 越积越多，
+`search` 就越来越慢（segment 膨胀）。
+
+**最佳实践**：把 `refresh_interval` 设为 **`-1`（禁用自动刷新）**。本 demo 在每批写入后调用
+**同步的** `index.refresh()`，可见性完全由它保证——下一批一定能看到上一批的写入。
+中途那些自动刷新对正确性毫无贡献，纯属制造碎 segment 的开销。
+
+```bash
+export OS_REFRESH_INTERVAL=-1   # demo 默认值；设 "1s" 可做 A/B 对比
+```
+
+> 因为显式 `index.refresh()` 是**同步**调用（返回即刷新完成、文档可见），
+> 每批末尾**无需再 sleep**。`REFRESH_WAIT_S` 默认已改为 `0`。
+
+### 2. 去重只需 top-1，用小的 ef_search
+
+**问题**：`knn.algo_param.ef_search` 默认偏大（如 256）对每次查询是纯 CPU 浪费——
+去重只需判断"最近的 1 个邻居是否 ≥ 0.95 阈值"，不需要高召回的 Top-K 排序。
+
+**最佳实践**：`ef_search` 设为 **32**（本 demo 默认）。若准确率统计显示近重复漏检增多，再上调。
+
+```bash
+export OS_EF_SEARCH=32   # demo 默认值；漏检偏多时试 64
+```
+
+> ⚠️ `ef_search` 是**索引级设置**，仅在**创建索引时**写入。改后必须**重建索引**（程序 `setup()` 会 drop+create）才生效，对已在运行的索引改代码无效。
+
+### 3. 分片数匹配"每片数据量"，避免过度分片
+
+**问题**：kNN 查询会 **fan-out 到所有分片**，每片各做一次 HNSW 搜索再合并。对固定数据集，
+**分片越多、单查询要做的 HNSW 小图搜索越多**。例如 10M 向量用 16 分片，每片仅 ~62 万，
+每个查询白白多做了约 8 倍的小图搜索。
+
+**最佳实践**：按**每片约 5–7M 向量**（生产每片约 75 GB）来定分片数，而非盲目求多。
+10M 数据用 2 分片即可；7B 才需要约 1,000+ 分片。
+
+```bash
+export OS_SHARDS=2   # 10M 测试建议值（对齐生产每片 ~5-7M 的比例）
+```
+
+### 4. 用分阶段计时定位瓶颈，别靠猜
+
+`--report-every-batch` 会逐批打印 `local / search / write / refresh` 各阶段耗时；
+结果 JSON 里也有 `phase_pct`。**先看哪一阶段在随 `idx_total` 增长而变慢**，再对症下药：
+
+- `search` 随规模上涨 → 上面 1/2/3 全部适用（关自动刷新 + 降 ef_search + 合理分片）。
+- `write` 随规模上涨 → 关注 segment merge、分片写入均衡、bulk 并行度。
+- `search` 阶段客户端 CPU 打满 → 瓶颈可能在客户端 JSON 编码（GIL 限制），可换 `orjson` / 多进程。
+
+### 5. 记住这是分布式引擎的强项
+
+OpenSearch 的每个查询会 **fan-out 到多个 shard/节点并行执行**，并可**水平加节点扩展**到十亿级。
+这正是它相对单机 pgvector 在本场景的架构优势。
+
+### 调优默认值一览（本 demo 已按最佳实践设置）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `OS_REFRESH_INTERVAL` | `-1` | 禁用自动刷新，只靠显式 refresh |
+| `REFRESH_WAIT_S` | `0` | 显式 refresh 已同步，无需额外 sleep |
+| `OS_EF_SEARCH` | `32` | 去重 top-1 够用，省 CPU |
+| `OS_SHARDS` | `8` | **按数据量调整**：10M→2，7B→1000+ |
+
+---
+
 ## pgvector 建索引内存调优（重要）
 
 pgvector 的 **HNSW 索引构建对内存极其敏感**。构建时整个图会尽量放进
