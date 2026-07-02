@@ -38,6 +38,12 @@ class Config:
     # small ef_search cuts per-query CPU a lot. Raise via OS_EF_SEARCH if
     # accuracy stats show missed near-duplicates.
     hnsw_ef_search: int = int(os.getenv("OS_EF_SEARCH", "32"))
+    # mmap-based vector search instead of loading the full HNSW graph into
+    # the JVM heap / off-heap native memory. Lets the OS page cache manage
+    # vector data, which can help when many segments exist (our refresh-
+    # heavy workload keeps producing new segments before merge catches up).
+    knn_memory_optimized_search: bool = (
+        os.getenv("OS_KNN_MEMORY_OPTIMIZED_SEARCH", "false").lower() == "true")
     number_of_shards: int = int(os.getenv("OS_SHARDS", "8"))
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
     # Merge policy: fewer, larger segments -> faster kNN search (each segment
@@ -130,6 +136,7 @@ class Config:
                     "refresh_interval": self.refresh_interval,
                     "knn": True,
                     "knn.algo_param.ef_search": self.hnsw_ef_search,
+                    "knn.memory_optimized_search": self.knn_memory_optimized_search,
                     # more aggressive segment merging -> fewer HNSW graphs to
                     # search as the index grows
                     "merge.policy.max_merge_at_once": self.merge_max_at_once,
