@@ -45,27 +45,32 @@ export OS_EF_SEARCH=32   # 默认值；漏检偏多可调到 64
 
 ---
 
-## 3. 适度的段合并策略
+## 3. 启用 memory-optimized search，配合默认段合并策略
 
 **参数**：
 ```bash
-export OS_MERGE_MAX_AT_ONCE=10
-export OS_MERGE_SEGMENTS_PER_TIER=10
-export OS_MERGE_FLOOR_SEGMENT=50mb
-export OS_MERGE_SCHEDULER_MAX_THREAD_COUNT=4
-export OS_MERGE_MAX_MERGED_SEGMENT=1gb
+export OS_KNN_MEMORY_OPTIMIZED_SEARCH=true   # 需 OpenSearch 3.1+
+# 段合并策略保持 OpenSearch 默认值，不需要额外调整
 ```
 
 **好处**：每批显式 refresh 会持续产生新 segment，段越多，每次 kNN 查询要遍历的独立
-HNSW 图越多，`search` 会变慢。适度合并策略能让段更快合并成更少、更大的段，从而
-减少查询要遍历的图数量。同时调大合并线程数（默认 1 个/shard）并调小单次合并目标
-大小，避免合并跟不上写入速度时触发磁盘 IO 限流（进而拖慢 refresh）。
+HNSW 图越多。`memory_optimized_search` 让 Faiss 引擎通过内存映射（mmap）+ 操作系统
+页缓存来访问向量索引文件，而不是把整个索引全量加载到 off-heap 内存，使查询性能
+不再随 segment 数量增长而明显下降。实测：启用后 `search` 阶段随索引从 0 增长到 200
+万+ 行几乎保持恒定（2.6-3.1s），不再随规模上升。
 
-> ⚠️ 均为索引级设置，改动后需重建索引。
+**段合并策略保持默认即可**：由于 search 已不受 segment 数量影响，无需再通过调大
+`merge.scheduler.max_thread_count`、调小 `merge.policy.max_merged_segment` 等参数
+让合并更激进。保持默认合并参数反而更稳定——过于激进的合并目标会让后台合并线程
+跟不上写入速度，触发 OpenSearch 的磁盘 IO 限流（auto throttle），拖慢同步
+`index.refresh()` 的返回时间。实测：默认合并参数下，`refresh` 稳定在 0.2-0.9s，
+连续 60+ 批次没有出现阻塞尖峰。
 
-**batch 大小建议**：推荐 `BATCH_SIZE=20000`。segment 产生频率由 refresh 频率（每批
-一次）决定，与 batch 大小无关；大 batch 只会让本地去重（numpy 矩阵运算）变慢，对
-减少 segment 数没有帮助。
+> ⚠️ `memory_optimized_search` 是索引级设置，改动后需重建索引；仅支持 Faiss + HNSW
+> 引擎，且要求索引在 OpenSearch 2.19+ 创建。
+
+**batch 大小建议**：推荐 `BATCH_SIZE=20000-40000`。batch 越大本地去重（numpy 矩阵
+运算）越慢，需要结合客户端算力权衡。
 
 ---
 
@@ -107,16 +112,14 @@ export BULK_CHUNK=5000
 | `OS_REFRESH_INTERVAL` | `-1` | 禁用自动刷新，避免产生多余 segment |
 | `REFRESH_WAIT_S` | `0` | 显式 refresh 已同步，无需额外等待 |
 | `OS_EF_SEARCH` | `32` | 去重只需 top-1，降低每次查询的 CPU 开销 |
-| `OS_MERGE_MAX_AT_ONCE` | `10` | 适度加快段合并，减少查询要遍历的图数 |
-| `OS_MERGE_SEGMENTS_PER_TIER` | `10` | 同上 |
-| `OS_MERGE_FLOOR_SEGMENT` | `50mb` | 同上 |
-| `OS_MERGE_SCHEDULER_MAX_THREAD_COUNT` | `4` | 避免合并跟不上写入速度触发限流 |
-| `OS_MERGE_MAX_MERGED_SEGMENT` | `1gb` | 减少单次合并的数据量和耗时 |
-| `BATCH_SIZE` | `20000` | 大 batch 只拖慢本地去重，无助于减少 segment |
+| `OS_KNN_MEMORY_OPTIMIZED_SEARCH` | `true`（需 3.1+） | mmap 访问索引，search 不再随 segment 数增长而变慢 |
+| 段合并相关参数 | 保持 OpenSearch 默认值 | 过激进的合并目标会触发磁盘 IO 限流，拖慢 refresh |
+| `BATCH_SIZE` | `20000-40000` | 按客户端算力权衡；越大本地去重越慢 |
 | `orjson` | 安装后自动启用 | 客户端序列化提速 5-10× |
 | `MSEARCH_CHUNK` | `500` | 配合 orjson 提高并行粒度 |
 | `MSEARCH_WORKERS` | `64`（按集群 vCPU 调整） | 打满集群检索并发 |
 | `BULK_CHUNK` / `BULK_WORKERS` | `5000` / `8` | 并行写入吞吐 |
 
-> 除 `MSEARCH_CHUNK` / `MSEARCH_WORKERS` / `BULK_CHUNK` / `BULK_WORKERS` / `BATCH_SIZE`
-> / `orjson` 外均为**索引级设置**，改动后需重建索引才生效。
+> `OS_EF_SEARCH` / `OS_KNN_MEMORY_OPTIMIZED_SEARCH` 为索引级设置，改动后需重建索引才生效。
+> `MSEARCH_CHUNK` / `MSEARCH_WORKERS` / `BULK_CHUNK` / `BULK_WORKERS` / `BATCH_SIZE` /
+> `orjson` 为客户端/运行时参数，可随时调整无需重建索引。
