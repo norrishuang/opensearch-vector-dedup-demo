@@ -6,13 +6,20 @@
 >
 > 本项目 `src/config.py` 的默认值已按下述最佳实践设置。
 
+> **测试环境前提**：本文的实测数据与调优结论均基于以下集群配置得出，参数的绝对值
+> （如 `MSEARCH_WORKERS`、分片数）应按你自己集群的规模等比例调整：
+> - **集群规模**：16 × `r8g.8xlarge`（每节点 32 vCPU / 256 GB 内存，共 512 vCPU）
+> - **索引配置**：16 主分片 / 0 副本
+> - **向量**：768 维 FP32，L2 归一化，去重阈值余弦 ≥ 0.95
+> - **数据规模**：10M 压测
+
 ---
 
 ## 0. 一句话结论
 
 - **绝对吞吐低** 多半是**集群没喂饱**（检索并发太低 / 过度分片 / 客户端编码瓶颈），不是 HNSW 算力不够——先定位再优化。优先安装 `orjson`（客户端序列化提速 5-10×）。
 - **随规模变慢** 主要是 HNSW 的 **log(N) 本征增长** + segment 叠加，属**温和退化**（不会断崖），可用刷新/合并/分片策略压平。
-- **7B 规模** 下"单索引 + 边写边查 + 单 worker 顺序"这个形状会顶不住 deadline，应认真评估**两阶段离线去重**（见第 6 节）。
+- **7B 规模** 下"单索引 + 边写边查 + 单 worker 顺序"这个形状会顶不住 deadline，应认真评估**两阶段离线去重**（见第 7 节）。
 
 ---
 
@@ -75,19 +82,24 @@ export OS_SHARDS=2   # 10M 测试建议值
 **问题**：即使关了自动刷新，每批显式 refresh 仍会产生 segment；默认合并策略较保守，段数会积累。
 段越多，每次 kNN 查询要遍历的独立 HNSW 图越多。
 
-**最佳实践**：建索引时用更激进的合并策略，让段尽快合并成更少、更大的段：
+**最佳实践**：建索引时用比默认稍激进的合并策略，让段合并成更少、更大的段：
 
 ```json
-"merge.policy.max_merge_at_once": 20,
-"merge.policy.segments_per_tier": 5,
+"merge.policy.max_merge_at_once": 10,
+"merge.policy.segments_per_tier": 10,
 "merge.policy.floor_segment": "50mb"
 ```
 
 ```bash
-export OS_MERGE_MAX_AT_ONCE=20
-export OS_MERGE_SEGMENTS_PER_TIER=5
+export OS_MERGE_MAX_AT_ONCE=10
+export OS_MERGE_SEGMENTS_PER_TIER=10
 export OS_MERGE_FLOOR_SEGMENT=50mb
 ```
+
+> ⚠️ 不要过度激进！ 实测 `segments_per_tier=5` + `max_merge_at_once=20` 会让**同步的每批
+> `index.refresh()` 阻塞在大段合并上**——refresh 从 0.3s 飙到 ~10s，反而成为新瓶颈
+> （write 13s + refresh 10s 占总时间 70%）。回调到 `10 / 10` 后 refresh 恢复到 1-2s。
+> **合并策略的目标是"压平 search 的增长"，而不是"把段数压到极限"**——过度合并的成本会转嫁到 refresh。
 
 > ⚠️ 同为**索引级设置**，改后需重建索引。
 >
@@ -221,7 +233,7 @@ export MSEARCH_WORKERS=64      # 按集群 vCPU 规模上调
 | `REFRESH_WAIT_S` | `0` | 显式 refresh 已同步，无需额外 sleep |
 | `OS_EF_SEARCH` | `32` | 去重 top-1 够用，省 CPU |
 | `OS_SHARDS` | `8` | **按数据量调整**：10M→2，1 亿→~16，7B→1000+ |
-| `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | `20` / `5` / `50mb` | 更激进合并段，减少每查询要遍历的 HNSW 图数 |
+| `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | `10` / `10` / `50mb` | 适度合并段；过激进（如 5/20）会让每批 refresh 阻塞在大合并上 |
 | `BATCH_SIZE` | `20000` | 大 batch 只拖慢本地去重，对 segment 无帮助 |
 | `MSEARCH_CHUNK` | `1000` | 缩小到 500 可提高并行粒度（需配合 orjson） |
 | `MSEARCH_WORKERS` | `20` | **按集群 vCPU 上调**（如 512 vCPU → 64–128）以打满集群 |

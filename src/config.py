@@ -42,9 +42,11 @@ class Config:
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
     # Merge policy: fewer, larger segments -> faster kNN search (each segment
     # holds an independent HNSW graph, so fewer segments = fewer graphs to
-    # traverse per query). Tuned to be more aggressive than defaults.
-    merge_max_at_once: int = int(os.getenv("OS_MERGE_MAX_AT_ONCE", "20"))
-    merge_segments_per_tier: int = int(os.getenv("OS_MERGE_SEGMENTS_PER_TIER", "5"))
+    # traverse per query). NOTE: too aggressive (e.g. segments_per_tier=5)
+    # makes the synchronous per-batch refresh block on large merges (refresh
+    # observed at ~10s). These values balance segment count vs refresh cost.
+    merge_max_at_once: int = int(os.getenv("OS_MERGE_MAX_AT_ONCE", "10"))
+    merge_segments_per_tier: int = int(os.getenv("OS_MERGE_SEGMENTS_PER_TIER", "10"))
     merge_floor_segment: str = os.getenv("OS_MERGE_FLOOR_SEGMENT", "50mb")
     # "-1" disables periodic auto-refresh: visibility is driven solely by the
     # explicit index.refresh() at the end of each batch. This avoids the ~1
