@@ -10,7 +10,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
+from opensearchpy import OpenSearch, RequestsHttpConnection
 
 try:
     import orjson
@@ -121,16 +121,36 @@ class DedupIndex(VectorBackend):
 
     # ---- bulk index (survivors) ----
     def _bulk_chunk(self, chunk_vecs: np.ndarray, chunk_ids) -> int:
-        actions = (
-            {
-                "_index": self.cfg.index_name,
-                "_source": {"embedding": v.tolist(), "video_id": str(vid)},
-            }
-            for v, vid in zip(chunk_vecs, chunk_ids)
-        )
-        ok, _ = helpers.bulk(self.client, actions, chunk_size=len(chunk_vecs),
-                             request_timeout=self.cfg.request_timeout)
-        return ok
+        """Build the NDJSON body ourselves (via orjson) instead of going
+        through ``helpers.bulk``, whose default serializer is stdlib
+        ``json`` -- the same GIL-bound bottleneck we already fixed for
+        ``_msearch`` (see ``_fast_dumps``), but it wasn't wired into the
+        bulk path until now.
+        """
+        header = _fast_dumps({"index": {"_index": self.cfg.index_name}})
+        lines = []
+        for v, vid in zip(chunk_vecs, chunk_ids):
+            lines.append(header)
+            lines.append(_fast_dumps({
+                "embedding": v.tolist(),
+                "video_id": str(vid),
+            }))
+        body = "\n".join(lines) + "\n"
+        resp = self.client.bulk(body=body, request_timeout=self.cfg.request_timeout)
+        if resp.get("errors"):
+            # count actual successes; log the first error for visibility
+            ok = 0
+            first_err = None
+            for item in resp["items"]:
+                action = item.get("index", {})
+                if action.get("status", 500) < 300:
+                    ok += 1
+                elif first_err is None:
+                    first_err = action.get("error")
+            if first_err is not None:
+                print(f"[warn] bulk had errors, first: {first_err}")
+            return ok
+        return len(chunk_vecs)
 
     def index_survivors(self, vectors: np.ndarray, ids) -> int:
         if len(vectors) == 0:
