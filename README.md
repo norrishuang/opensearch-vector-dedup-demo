@@ -296,10 +296,11 @@ OpenSearch 的每个查询会被**分散到多个 shard/节点并行**；pgvecto
 | `OS_INDEX` | 索引名 | video_vectors |
 | `OS_SHARDS` / `OS_REPLICAS` | 主分片 / 副本数 | 8 / 0 |
 | `OS_EF_SEARCH` | HNSW 检索候选队列（去重 top-1 用小值更快，索引级，改后需重建索引） | 32 |
+| `OS_REFRESH_INTERVAL` | 索引自动刷新周期。`-1` 禁用自动刷新，可见性完全靠每批末尾的显式 refresh，避免 search/write 期间频繁 refresh 切碎 segment | -1 |
 | `BATCH_SIZE` | 批大小 | 20000 |
 | `MSEARCH_CHUNK` / `BULK_CHUNK` | 检索/写入分块大小 | 1000 / 5000 |
 | `MSEARCH_WORKERS` / `BULK_WORKERS` | 检索/写入并行度 | 20 / 4 |
-| `REFRESH_WAIT_S` | 每批后等待刷新秒数（仅 OpenSearch） | 1.0 |
+| `REFRESH_WAIT_S` | 每批后额外 sleep 秒数（显式 refresh 已同步，通常不需要） | 0 |
 | `NEAR_DUP_SIM` | 注入近重复的余弦相似度（越低越难） | 0.99 |
 | `PG_HOST` / `PG_PORT` | RDS PostgreSQL 端点 | localhost / 5432 |
 | `PG_DB` / `PG_USER` / `PG_PASSWORD` | 数据库 / 用户 / 密码 | vectordb / postgres / 空 |

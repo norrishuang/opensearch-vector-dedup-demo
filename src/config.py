@@ -40,7 +40,12 @@ class Config:
     hnsw_ef_search: int = int(os.getenv("OS_EF_SEARCH", "32"))
     number_of_shards: int = int(os.getenv("OS_SHARDS", "8"))
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
-    refresh_interval: str = "1s"
+    # "-1" disables periodic auto-refresh: visibility is driven solely by the
+    # explicit index.refresh() at the end of each batch. This avoids the ~1
+    # refresh/sec firing during search+write (each auto-refresh cuts a new
+    # segment -> segment bloat -> search slows down). Set OS_REFRESH_INTERVAL
+    # back to e.g. "1s" for A/B comparison.
+    refresh_interval: str = os.getenv("OS_REFRESH_INTERVAL", "-1")
 
     # ---- Dedup thresholds ----
     cosine_threshold: float = 0.95            # >= is a duplicate
@@ -52,7 +57,9 @@ class Config:
     bulk_chunk: int = int(os.getenv("BULK_CHUNK", "5000"))
     msearch_workers: int = int(os.getenv("MSEARCH_WORKERS", "20"))
     bulk_workers: int = int(os.getenv("BULK_WORKERS", "4"))
-    refresh_wait_s: float = float(os.getenv("REFRESH_WAIT_S", "1.0"))
+    # index.refresh() is synchronous (returns after the refresh completes), so
+    # an extra sleep is normally unnecessary. Default 0; raise if needed.
+    refresh_wait_s: float = float(os.getenv("REFRESH_WAIT_S", "0"))
 
     # ---- PostgreSQL / pgvector connection (RDS) ----
     pg_host: str = os.getenv("PG_HOST", "localhost")
