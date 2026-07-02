@@ -12,6 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
 
+try:
+    import orjson
+    _fast_dumps = lambda obj: orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    _fast_dumps = json.dumps
+
 from .config import Config
 from .backend_base import VectorBackend
 
@@ -81,14 +87,17 @@ class DedupIndex(VectorBackend):
     # ---- radial search (is-duplicate check) ----
     def _msearch_chunk(self, chunk: np.ndarray) -> list[bool]:
         """Return per-row ``has_match`` booleans for one chunk."""
+        # Pre-built header line (same for all vectors in the index)
+        header = _fast_dumps({"index": self.cfg.index_name})
+        min_score = self.cfg.min_score
         lines = []
         for v in chunk:
-            lines.append(json.dumps({"index": self.cfg.index_name}))
-            lines.append(json.dumps({
+            lines.append(header)
+            lines.append(_fast_dumps({
                 "size": 1,
                 "query": {"knn": {"embedding": {
                     "vector": v.tolist(),
-                    "min_score": self.cfg.min_score,
+                    "min_score": min_score,
                 }}},
             }))
         body = "\n".join(lines) + "\n"

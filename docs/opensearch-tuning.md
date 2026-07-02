@@ -10,7 +10,7 @@
 
 ## 0. 一句话结论
 
-- **绝对吞吐低** 多半是**集群没喂饱**（检索并发太低 / 过度分片 / 客户端编码瓶颈），不是 HNSW 算力不够——先定位再优化。
+- **绝对吞吐低** 多半是**集群没喂饱**（检索并发太低 / 过度分片 / 客户端编码瓶颈），不是 HNSW 算力不够——先定位再优化。优先安装 `orjson`（客户端序列化提速 5-10×）。
 - **随规模变慢** 主要是 HNSW 的 **log(N) 本征增长** + segment 叠加，属**温和退化**（不会断崖），可用刷新/合并/分片策略压平。
 - **7B 规模** 下"单索引 + 边写边查 + 单 worker 顺序"这个形状会顶不住 deadline，应认真评估**两阶段离线去重**（见第 6 节）。
 
@@ -130,7 +130,62 @@ batch 140| n=20,000 | local 1.2s  search 16.2s  write 5.9s  refresh 1.3s | ...
 
 ---
 
-## 6. 大规模（亿级 / 十亿级）的架构建议
+## 6. 客户端序列化优化：用 orjson 替代标准 json ⭐
+
+**问题**：`_msearch` 请求体需要将每条 768 维 FP32 向量序列化为 JSON。Python 标准库 `json.dumps`
+是纯 Python 实现，受 GIL 限制，序列化大量浮点数组时成为**客户端瓶颈**——即使开 64 个线程，
+实际只有 1 个 CPU 核在做 JSON 编码。
+
+**实测对比**（10M 测试，batch=40K, MSEARCH_CHUNK=500, MSEARCH_WORKERS=64）：
+
+| 序列化库 | batch 1 search | batch 4 search | vps |
+|---------|---------------|---------------|-----|
+| 标准 json | 10.64s | 15.19s | ~1,330 |
+| **orjson** | **1.73s** | **2.82s** | **~2,150** |
+| **提升** | **6.2×** | **5.4×** | **+62%** |
+
+**最佳实践**：安装 `orjson`（C 实现的高性能 JSON 库），代码自动使用：
+
+```bash
+pip install orjson>=3.9.0
+```
+
+```python
+# os_client.py 中的实现（已集成）
+try:
+    import orjson
+    _fast_dumps = lambda obj: orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    _fast_dumps = json.dumps  # fallback 到标准库
+```
+
+**原理**：
+- `orjson` 用 Rust/C 编写，序列化速度是标准 `json` 的 5-10 倍
+- 对 numpy float 数组序列化尤其高效
+- 不受 Python GIL 限制，线程并发时不互相阻塞
+- 向后兼容：如未安装 orjson 则自动 fallback 到标准 json
+
+**配合 MSEARCH_CHUNK 和 MSEARCH_WORKERS 使用**：
+
+解决了客户端编码瓶颈后，可以进一步缩小 chunk、增大并发，让集群 CPU 被充分利用：
+
+```bash
+export MSEARCH_CHUNK=500       # 从默认 1000 减半，更多并行粒度
+export MSEARCH_WORKERS=64      # 按集群 vCPU 规模上调
+```
+
+| 配置 | search 阶段耗时 | 说明 |
+|------|---------------|------|
+| json + CHUNK=1000 + W=32 | ~15s/批 | 客户端编码瓶颈 |
+| orjson + CHUNK=1000 + W=32 | ~5s/批 | 编码快了，但 chunk 数少 |
+| **orjson + CHUNK=500 + W=64** | **~3s/批** | 编码快 + 并发打满 |
+
+> 判断方法：若集群 data node CPU 仅 20-30%，说明客户端没喂饱。用 orjson + 更高并发后
+> 集群 CPU 应上升到 50-70%，吞吐同步提升。
+
+---
+
+## 7. 大规模（亿级 / 十亿级）的架构建议
 
 ### 6.1 退化是温和的，但吞吐天花板是真的
 
@@ -158,7 +213,7 @@ batch 140| n=20,000 | local 1.2s  search 16.2s  write 5.9s  refresh 1.3s | ...
 
 ---
 
-## 7. 调优默认值一览（本项目已按最佳实践设置）
+## 8. 调优默认值一览（本项目已按最佳实践设置）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -168,9 +223,11 @@ batch 140| n=20,000 | local 1.2s  search 16.2s  write 5.9s  refresh 1.3s | ...
 | `OS_SHARDS` | `8` | **按数据量调整**：10M→2，1 亿→~16，7B→1000+ |
 | `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | `20` / `5` / `50mb` | 更激进合并段，减少每查询要遍历的 HNSW 图数 |
 | `BATCH_SIZE` | `20000` | 大 batch 只拖慢本地去重，对 segment 无帮助 |
+| `MSEARCH_CHUNK` | `1000` | 缩小到 500 可提高并行粒度（需配合 orjson） |
 | `MSEARCH_WORKERS` | `20` | **按集群 vCPU 上调**（如 512 vCPU → 64–128）以打满集群 |
+| `orjson` | 自动检测 | 安装后自动启用，search 序列化提速 5-10× |
 
-> 以上除 `MSEARCH_WORKERS` / `BATCH_SIZE` 外均为**索引级设置**，改后需重建索引才生效。
+> 以上除 `MSEARCH_WORKERS` / `MSEARCH_CHUNK` / `BATCH_SIZE` / `orjson` 外均为**索引级设置**，改后需重建索引才生效。
 
 ---
 
