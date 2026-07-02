@@ -34,7 +34,10 @@ class Config:
     space_type: str = "innerproduct"          # cosine on normalized vectors
     hnsw_m: int = 16
     hnsw_ef_construction: int = 128
-    hnsw_ef_search: int = 256
+    # Dedup only needs top-1 above threshold, not high-recall ranking, so a
+    # small ef_search cuts per-query CPU a lot. Raise via OS_EF_SEARCH if
+    # accuracy stats show missed near-duplicates.
+    hnsw_ef_search: int = int(os.getenv("OS_EF_SEARCH", "32"))
     number_of_shards: int = int(os.getenv("OS_SHARDS", "8"))
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
     refresh_interval: str = "1s"

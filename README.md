@@ -145,7 +145,7 @@ python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
 | 一致性 | 近实时（写入后需 ~1s 刷新） | 事务一致（commit 后立即可见，无需等待） |
 | 检索 | `_msearch` 并行分块 | 默认 `single`：逐条带绑定参数 kNN（走 HNSW 索引），线程池并行 |
 | 写入 | `_bulk` 并行分块 | `execute_values` 批量 INSERT，线程池并行 |
-| 建库参数 | m=16, ef_construction=128, ef_search=256 | m=16, ef_construction=128, ef_search=128（`PG_HNSW_*`） |
+| 建库参数 | m=16, ef_construction=128, ef_search=32（`OS_EF_SEARCH`） | m=16, ef_construction=128, ef_search=128（`PG_HNSW_*`） |
 | 单查询并行 | 集群多 shard/节点并行 | 单实例单进程，靠客户端多连接并发 |
 
 > 因 PostgreSQL 是事务一致的，pgvector 后端**不需要** OpenSearch 那样的批间刷新等待，
@@ -295,6 +295,7 @@ OpenSearch 的每个查询会被**分散到多个 shard/节点并行**；pgvecto
 | `OS_AWS_REGION` / `OS_AWS_SERVICE` | SigV4 区域/服务（es 或 aoss） | us-west-2 / es |
 | `OS_INDEX` | 索引名 | video_vectors |
 | `OS_SHARDS` / `OS_REPLICAS` | 主分片 / 副本数 | 8 / 0 |
+| `OS_EF_SEARCH` | HNSW 检索候选队列（去重 top-1 用小值更快，索引级，改后需重建索引） | 32 |
 | `BATCH_SIZE` | 批大小 | 20000 |
 | `MSEARCH_CHUNK` / `BULK_CHUNK` | 检索/写入分块大小 | 1000 / 5000 |
 | `MSEARCH_WORKERS` / `BULK_WORKERS` | 检索/写入并行度 | 20 / 4 |
@@ -318,7 +319,7 @@ OpenSearch 的每个查询会被**分散到多个 shard/节点并行**；pgvecto
 | 维度 | 768 (FP32) | 视频 Embedding，需 **L2 归一化** |
 | 空间类型 | `innerproduct` | 归一化后等价余弦 |
 | 去重阈值 | 余弦 ≥ 0.95 | `min_score = 1.95`（分数 = 1 + 余弦） |
-| HNSW | m=16, ef_c=128, ef_search=256 | Faiss 引擎 |
+| HNSW | m=16, ef_c=128, ef_search=32（可调 `OS_EF_SEARCH`） | Faiss 引擎 |
 | 批大小 | 20,000 | 单周期 |
 | 分块 | `_msearch` 1K/块、`_bulk` 5K/块 | 规避 100MB 请求上限 |
 
