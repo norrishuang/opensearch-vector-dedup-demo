@@ -40,6 +40,12 @@ class Config:
     hnsw_ef_search: int = int(os.getenv("OS_EF_SEARCH", "32"))
     number_of_shards: int = int(os.getenv("OS_SHARDS", "8"))
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
+    # Merge policy: fewer, larger segments -> faster kNN search (each segment
+    # holds an independent HNSW graph, so fewer segments = fewer graphs to
+    # traverse per query). Tuned to be more aggressive than defaults.
+    merge_max_at_once: int = int(os.getenv("OS_MERGE_MAX_AT_ONCE", "20"))
+    merge_segments_per_tier: int = int(os.getenv("OS_MERGE_SEGMENTS_PER_TIER", "5"))
+    merge_floor_segment: str = os.getenv("OS_MERGE_FLOOR_SEGMENT", "50mb")
     # "-1" disables periodic auto-refresh: visibility is driven solely by the
     # explicit index.refresh() at the end of each batch. This avoids the ~1
     # refresh/sec firing during search+write (each auto-refresh cuts a new
@@ -113,6 +119,11 @@ class Config:
                     "refresh_interval": self.refresh_interval,
                     "knn": True,
                     "knn.algo_param.ef_search": self.hnsw_ef_search,
+                    # more aggressive segment merging -> fewer HNSW graphs to
+                    # search as the index grows
+                    "merge.policy.max_merge_at_once": self.merge_max_at_once,
+                    "merge.policy.segments_per_tier": self.merge_segments_per_tier,
+                    "merge.policy.floor_segment": self.merge_floor_segment,
                 }
             },
             "mappings": {
