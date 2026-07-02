@@ -48,6 +48,15 @@ class Config:
     merge_max_at_once: int = int(os.getenv("OS_MERGE_MAX_AT_ONCE", "10"))
     merge_segments_per_tier: int = int(os.getenv("OS_MERGE_SEGMENTS_PER_TIER", "10"))
     merge_floor_segment: str = os.getenv("OS_MERGE_FLOOR_SEGMENT", "50mb")
+    # Root cause of refresh blocking: default merge.scheduler.max_thread_count=1
+    # means merges run on a single thread per shard. When merge falls behind
+    # our write rate, OpenSearch's auto_throttle kicks in and throttles disk
+    # IO for writes/refresh to let merge catch up (observed via
+    # merge.total_throttled_time_in_millis). More merge threads + a smaller
+    # merge target size avoids triggering throttle in the first place.
+    merge_scheduler_max_thread_count: int = int(
+        os.getenv("OS_MERGE_SCHEDULER_MAX_THREAD_COUNT", "4"))
+    merge_max_merged_segment: str = os.getenv("OS_MERGE_MAX_MERGED_SEGMENT", "1gb")
     # "-1" disables periodic auto-refresh: visibility is driven solely by the
     # explicit index.refresh() at the end of each batch. This avoids the ~1
     # refresh/sec firing during search+write (each auto-refresh cuts a new
@@ -126,6 +135,11 @@ class Config:
                     "merge.policy.max_merge_at_once": self.merge_max_at_once,
                     "merge.policy.segments_per_tier": self.merge_segments_per_tier,
                     "merge.policy.floor_segment": self.merge_floor_segment,
+                    "merge.policy.max_merged_segment": self.merge_max_merged_segment,
+                    # more merge threads + smaller merge target avoids
+                    # OpenSearch's auto_throttle blocking writes/refresh when
+                    # a single merge thread falls behind our write rate
+                    "merge.scheduler.max_thread_count": self.merge_scheduler_max_thread_count,
                 }
             },
             "mappings": {

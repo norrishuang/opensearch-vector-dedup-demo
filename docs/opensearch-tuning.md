@@ -97,9 +97,22 @@ export OS_MERGE_FLOOR_SEGMENT=50mb
 ```
 
 > ⚠️ 不要过度激进！ 实测 `segments_per_tier=5` + `max_merge_at_once=20` 会让**同步的每批
-> `index.refresh()` 阻塞在大段合并上**——refresh 从 0.3s 飙到 ~10s，反而成为新瓶颈
-> （write 13s + refresh 10s 占总时间 70%）。回调到 `10 / 10` 后 refresh 恢复到 1-2s。
-> **合并策略的目标是"压平 search 的增长"，而不是"把段数压到极限"**——过度合并的成本会转嫁到 refresh。
+> `index.refresh()` 阻塞在大段合并上**——refresh 从 0.3s 飙到持续 ~10s，反而成为新瓶颈
+> （write 13s + refresh 10s 占总时间 70%）。**根因排查**：查 `_stats/merge` 发现
+> `merge.total_throttled_time_in_millis` 累积到 200+ 秒——OpenSearch 默认
+> `merge.scheduler.max_thread_count=1`（每 shard 仅 1 个后台合并线程），当合并速度跟不上
+> 写入速度时，`auto_throttle` 会**反向限制写入/refresh 的磁盘 IO** 来给合并让路。
+>
+> **修复**：调大 `merge.scheduler.max_thread_count`（默认 1 → 4）+ 调小
+> `merge.policy.max_merged_segment`（默认 5gb → 1gb，减少单次合并的数据量）：
+> ```bash
+> export OS_MERGE_SCHEDULER_MAX_THREAD_COUNT=4
+> export OS_MERGE_MAX_MERGED_SEGMENT=1gb
+> ```
+> 效果：refresh 从"持续卡 8-10s"变为"周期性尖峰 10s + 大部分批次 0.2-0.6s"，10M 测试整体吞吐
+> **提升约 31%**（1,166 → 1,526 vec/s）。尖峰未完全消除——单次大合并的 IO 耗时是物理上限，
+> 线程数只能让合并更快追上写入速度，不能让合并瞬间完成。**合并策略的目标是"压平 search 的
+> 增长"，而不是"把段数压到极限"**——过度合并的成本会转嫁到 refresh。
 
 > ⚠️ 同为**索引级设置**，改后需重建索引。
 >
@@ -234,6 +247,8 @@ export MSEARCH_WORKERS=64      # 按集群 vCPU 规模上调
 | `OS_EF_SEARCH` | `32` | 去重 top-1 够用，省 CPU |
 | `OS_SHARDS` | `8` | **按数据量调整**：10M→2，1 亿→~16，7B→1000+ |
 | `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | `10` / `10` / `50mb` | 适度合并段；过激进（如 5/20）会让每批 refresh 阻塞在大合并上 |
+| `OS_MERGE_SCHEDULER_MAX_THREAD_COUNT` | `4` | 默认 1 个合并线程/shard 常跟不上写入速度触发 throttle；调大缓解 refresh 尖峰 |
+| `OS_MERGE_MAX_MERGED_SEGMENT` | `1gb` | 默认 5gb；调小减少单次合并的数据量和耗时 |
 | `BATCH_SIZE` | `20000` | 大 batch 只拖慢本地去重，对 segment 无帮助 |
 | `MSEARCH_CHUNK` | `1000` | 缩小到 500 可提高并行粒度（需配合 orjson） |
 | `MSEARCH_WORKERS` | `20` | **按集群 vCPU 上调**（如 512 vCPU → 64–128）以打满集群 |
