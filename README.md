@@ -1,18 +1,24 @@
-# Vector Dedup — Test Demo（OpenSearch / RDS PostgreSQL）
+# Vector Dedup — Test Demo（Amazon OpenSearch Service）
 
-验证"顺序批量向量去重"方案的测试程序，**同时支持两种向量引擎**：
-
-- **Amazon OpenSearch Service**（Faiss HNSW kNN）
-- **Amazon RDS for PostgreSQL + pgvector**（HNSW cosine）
-
-生成模拟的 768 维视频 Embedding 向量，用 **numpy 矩阵乘法做本地去重**，再通过
-"径向检索 → 批量写入 → 刷新"的顺序批量循环，把去重后的唯一向量写入所选引擎。
-自带 **1 亿（100M）级别**压测能力与**去重准确率**评估。用 `--backend` 一键切换引擎，
-其余流程与统计完全一致，方便横向对比两种引擎的吞吐与准确率。
+验证"顺序批量向量去重"方案的测试程序。生成模拟的 768 维视频 Embedding 向量，
+用 **numpy 矩阵乘法做本地去重**，再通过"径向检索 → 批量写入 → 刷新"的顺序批量循环，
+把去重后的唯一向量写入 **Amazon OpenSearch Service**（Faiss HNSW kNN）。
+自带 **1 亿（100M）级别**压测能力与**去重准确率**评估。
 
 > 方案背景：视频训练集去重 —— 把视频编码为 768 维 FP32 归一化向量，移除余弦相似度
-> ≥ 0.95 的近重复。核心是"单 Worker 顺序批量"，用批次间的刷新等待消除并行方案的
+> ≥ 0.95 的近重复。核心是"单 Worker 顺序批量"，用批次间的显式刷新消除并行方案的
 > 刷新窗口竞态，从而无需事后全量清洗即可逼近 100% 准确率。
+>
+> 另提供一个**实验性的 pgvector（RDS PostgreSQL）后端**用于横向对比，见文末
+> [附录](#附录pgvector-后端实验性)。压测显示 pgvector 在本"边写边查、索引持续增长"
+> 场景下性能不佳，仅作对比参考。
+
+---
+
+## 📖 调优必读
+
+**OpenSearch kNN 边写边查的调优要点、实测数据趋势与大规模架构建议，见
+[docs/opensearch-tuning.md](docs/opensearch-tuning.md)。** 本项目默认值已按其中的最佳实践设置。
 
 ---
 
@@ -21,10 +27,11 @@
 - **流式数据生成**：不一次性占满内存，逐批生成归一化向量，支持 1 亿+ 规模。
 - **可控近重复 + 真值标注**：每个向量带 `group_id`，同组即近重复，用于精确测算去重准确率（泄漏的重复数）。
 - **numpy 本地去重**：`batch @ batch.T` 一次算出批内全部两两余弦相似度，精确且高效；大批量自动切换分块变体控制内存。
-- **双引擎可插拔**：`--backend opensearch` 或 `--backend pgvector`，同一套流程与统计，方便横向对比。
-- **顺序批量循环**：本地去重 → 径向检索（并行）→ 批量写入（并行）→ 刷新，完全对齐方案设计。
-- **Dry-run 模式**：无需任何集群/数据库，用真值 oracle 验证整条流水线与准确率逻辑。
-- **多种鉴权**：OpenSearch 支持 Basic Auth 与 AWS SigV4；PostgreSQL 支持标准连接 + SSL（RDS 默认）。
+- **顺序批量循环**：本地去重 → `_msearch` 径向检索（并行）→ `_bulk` 写入（并行）→ 显式刷新。
+- **分阶段计时**：`--report-every-batch` 逐批打印 local/search/write/refresh 耗时，定位瓶颈。
+- **Dry-run 模式**：无需任何集群，用真值 oracle 验证整条流水线与准确率逻辑。
+- **多种鉴权**：Basic Auth 与 AWS SigV4（托管 Amazon OpenSearch Service / Serverless）。
+- **可插拔后端**：主用 OpenSearch；附带实验性 pgvector 后端用于对比（`--backend pgvector`）。
 
 ---
 
@@ -39,8 +46,10 @@ opensearch-vector-dedup-demo/
 │   ├── local_dedup.py      # numpy 矩阵乘法本地去重（含分块变体）
 │   ├── backend_base.py     # 向量后端统一接口（VectorBackend）
 │   ├── os_client.py        # OpenSearch 后端：建索引 / _msearch / _bulk / refresh
-│   ├── pg_client.py        # PostgreSQL + pgvector 后端：建表 / HNSW / 检索 / 写入
+│   ├── pg_client.py        # pgvector 后端（实验性）
 │   └── dedup_runner.py     # 顺序批量主循环 + 后端工厂 + 吞吐/准确率统计
+├── docs/
+│   └── opensearch-tuning.md  # OpenSearch 调优最佳实践（必读）
 ├── tests/test_dedup.py     # 单元测试（本地去重正确性 + dry-run 零泄漏）
 ├── requirements.txt
 ├── LICENSE                 # MIT
@@ -59,8 +68,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 仅跑 dry-run（不连集群）时，只需要 `numpy`；连真实集群才需要 `opensearch-py`
-> 等其余依赖。
+> 仅跑 dry-run（不连集群）时只需 `numpy`；连真实集群才需要 `opensearch-py` 等其余依赖。
 
 ### 2. 先跑 Dry-run（无需集群，验证流水线）
 
@@ -76,8 +84,6 @@ python run_dedup.py --dry-run --total 100000 --batch-size 10000
   "indexed": 69859,
   "local_discarded": 7508,
   "os_discarded": 22633,
-  "batches": 10,
-  "elapsed_s": 5.09,
   "throughput_vps": 19630.3,
   "ground_truth_unique": 69859,
   "leaked_duplicates": 0,
@@ -85,9 +91,9 @@ python run_dedup.py --dry-run --total 100000 --batch-size 10000
 }
 ```
 
-- `indexed` == `ground_truth_unique` 且 `leaked_duplicates == 0` 说明去重逻辑正确。
+- `indexed == ground_truth_unique` 且 `leaked_duplicates == 0` 说明去重逻辑正确。
 
-### 3. 连接你的 OpenSearch 集群跑 1 亿压测
+### 3. 连接 OpenSearch 集群压测
 
 **Basic Auth（用户名/密码）：**
 
@@ -96,9 +102,10 @@ export OS_HOST=your-domain.us-west-2.es.amazonaws.com
 export OS_PORT=443
 export OS_USERNAME=admin
 export OS_PASSWORD='your-password'
-export OS_SHARDS=8          # 按集群规模调整
+export OS_SHARDS=2                # 按数据量调整，见调优文档
+export MSEARCH_WORKERS=64         # 按集群 vCPU 上调以打满集群
 
-python run_dedup.py --total 100000000 --batch-size 20000
+python run_dedup.py --total 100000000 --batch-size 20000 --report-every-batch
 ```
 
 **AWS SigV4（托管 Amazon OpenSearch Service）：**
@@ -107,285 +114,27 @@ python run_dedup.py --total 100000000 --batch-size 20000
 export OS_HOST=your-domain.us-west-2.es.amazonaws.com
 export OS_USE_AWS_AUTH=true
 export OS_AWS_REGION=us-west-2
-export OS_AWS_SERVICE=es     # OpenSearch Serverless 用 aoss
+export OS_AWS_SERVICE=es          # OpenSearch Serverless 用 aoss
 
-python run_dedup.py --total 100000000 --batch-size 20000
+python run_dedup.py --total 100000000 --batch-size 20000 --report-every-batch
 ```
 
 > 程序启动时会 **删除并重建** 目标索引（默认 `video_vectors`），请勿指向生产索引。
-
-### 4. 连接 RDS PostgreSQL（pgvector）跑压测
-
-先确认 RDS 实例已启用 `vector` 扩展（程序会自动执行 `CREATE EXTENSION IF NOT EXISTS vector`，
-需要账号有相应权限；RDS PostgreSQL 15+ 原生支持 pgvector）。
-
-```bash
-export BACKEND=pgvector
-export PG_HOST=your-instance.xxxxx.us-west-2.rds.amazonaws.com
-export PG_PORT=5432
-export PG_DB=vectordb
-export PG_USER=postgres
-export PG_PASSWORD='your-password'
-export PG_SSLMODE=require          # RDS 默认要求 SSL
-export PG_MAINTENANCE_WORK_MEM=4GB # 建 HNSW 索引内存，越大越快（见调优章节）
-
-python run_dedup.py --backend pgvector --total 100000000 --batch-size 20000
-```
-
-> 程序启动时会 **DROP 并重建** 目标表（默认 `video_vectors`）及其 HNSW cosine 索引，请勿指向生产表。
+> 调参前请先读 [docs/opensearch-tuning.md](docs/opensearch-tuning.md)。
 
 ---
 
-## 两种引擎对照
+## 工作原理
 
-| 维度 | OpenSearch | PostgreSQL + pgvector |
-|---|---|---|
-| 向量索引 | Faiss HNSW | pgvector HNSW |
-| 相似度 | innerproduct（`min_score=1.95`，需归一化） | cosine 距离 `<=>`（`dist <= 0.05`） |
-| 一致性 | 近实时（写入后需 ~1s 刷新） | 事务一致（commit 后立即可见，无需等待） |
-| 检索 | `_msearch` 并行分块 | 默认 `single`：逐条带绑定参数 kNN（走 HNSW 索引），线程池并行 |
-| 写入 | `_bulk` 并行分块 | `execute_values` 批量 INSERT，线程池并行 |
-| 建库参数 | m=16, ef_construction=128, ef_search=32（`OS_EF_SEARCH`） | m=16, ef_construction=128, ef_search=128（`PG_HNSW_*`） |
-| 单查询并行 | 集群多 shard/节点并行 | 单实例单进程，靠客户端多连接并发 |
+每个批次依次执行（**批次内并行、批次间顺序**）：
 
-> 因 PostgreSQL 是事务一致的，pgvector 后端**不需要** OpenSearch 那样的批间刷新等待，
-> 单批周期通常更短；但大规模下 HNSW 索引维护开销与 OpenSearch 分布式扩展性各有取舍，
-> 正是本 demo 想帮你实测对比的点。
+1. **本地去重**：`batch @ batch.T` 求批内两两余弦，丢弃 ≥ 0.95 的重复（精确）。
+2. **`_msearch` 径向检索**：把幸存向量对已建索引做检索，命中（余弦 ≥ 0.95）即为重复。
+3. **`_bulk` 写入**：仅写入未命中的向量。
+4. **显式刷新**：调用同步 `_refresh`，使本批写入对下一批可见（`refresh_interval=-1` 下这是唯一可见性来源）。
 
----
-
-## OpenSearch kNN 边写边查调优（最佳实践）
-
-"边写边查、索引持续增长"是这个去重场景的固有模式。默认配置下，随着索引变大，
-`search` 阶段会明显变慢。以下是实测验证过的调优要点，本 demo 的默认值已按最佳实践设置。
-
-### 1. 关闭周期性自动刷新，只靠每批显式 refresh 保证可见性
-
-**问题**：`refresh_interval` 默认 `1s` 时，一批约 25 秒的 `search`+`write` 期间，后台会触发
-约 25 次自动刷新，**每次刷新都切出一个新 segment**。而 Faiss/Lucene 的 HNSW 图是
-**按 segment 独立存在**的——一次 kNN 查询要遍历**每一个 segment 的小图**。segment 越积越多，
-`search` 就越来越慢（segment 膨胀）。
-
-**最佳实践**：把 `refresh_interval` 设为 **`-1`（禁用自动刷新）**。本 demo 在每批写入后调用
-**同步的** `index.refresh()`，可见性完全由它保证——下一批一定能看到上一批的写入。
-中途那些自动刷新对正确性毫无贡献，纯属制造碎 segment 的开销。
-
-```bash
-export OS_REFRESH_INTERVAL=-1   # demo 默认值；设 "1s" 可做 A/B 对比
-```
-
-> 因为显式 `index.refresh()` 是**同步**调用（返回即刷新完成、文档可见），
-> 每批末尾**无需再 sleep**。`REFRESH_WAIT_S` 默认已改为 `0`。
-
-### 2. 去重只需 top-1，用小的 ef_search
-
-**问题**：`knn.algo_param.ef_search` 默认偏大（如 256）对每次查询是纯 CPU 浪费——
-去重只需判断"最近的 1 个邻居是否 ≥ 0.95 阈值"，不需要高召回的 Top-K 排序。
-
-**最佳实践**：`ef_search` 设为 **32**（本 demo 默认）。若准确率统计显示近重复漏检增多，再上调。
-
-```bash
-export OS_EF_SEARCH=32   # demo 默认值；漏检偏多时试 64
-```
-
-> ⚠️ `ef_search` 是**索引级设置**，仅在**创建索引时**写入。改后必须**重建索引**（程序 `setup()` 会 drop+create）才生效，对已在运行的索引改代码无效。
-
-### 3. 分片数匹配"每片数据量"，避免过度分片
-
-**问题**：kNN 查询会 **fan-out 到所有分片**，每片各做一次 HNSW 搜索再合并。对固定数据集，
-**分片越多、单查询要做的 HNSW 小图搜索越多**。例如 10M 向量用 16 分片，每片仅 ~62 万，
-每个查询白白多做了约 8 倍的小图搜索。
-
-**最佳实践**：按**每片约 5–7M 向量**（生产每片约 75 GB）来定分片数，而非盲目求多。
-10M 数据用 2 分片即可；7B 才需要约 1,000+ 分片。
-
-```bash
-export OS_SHARDS=2   # 10M 测试建议值（对齐生产每片 ~5-7M 的比例）
-```
-
-### 4. 用分阶段计时定位瓶颈，别靠猜
-
-`--report-every-batch` 会逐批打印 `local / search / write / refresh` 各阶段耗时；
-结果 JSON 里也有 `phase_pct`。**先看哪一阶段在随 `idx_total` 增长而变慢**，再对症下药：
-
-- `search` 随规模上涨 → 上面 1/2/3 全部适用（关自动刷新 + 降 ef_search + 合理分片）。
-- `write` 随规模上涨 → 关注 segment merge、分片写入均衡、bulk 并行度。
-- `search` 阶段客户端 CPU 打满 → 瓶颈可能在客户端 JSON 编码（GIL 限制），可换 `orjson` / 多进程。
-
-### 5. 记住这是分布式引擎的强项
-
-OpenSearch 的每个查询会 **fan-out 到多个 shard/节点并行执行**，并可**水平加节点扩展**到十亿级。
-这正是它相对单机 pgvector 在本场景的架构优势。
-
-### 调优默认值一览（本 demo 已按最佳实践设置）
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `OS_REFRESH_INTERVAL` | `-1` | 禁用自动刷新，只靠显式 refresh |
-| `REFRESH_WAIT_S` | `0` | 显式 refresh 已同步，无需额外 sleep |
-| `OS_EF_SEARCH` | `32` | 去重 top-1 够用，省 CPU |
-| `OS_SHARDS` | `8` | **按数据量调整**：10M→2，7B→1000+ |
-| `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | `20` / `5` / `50mb` | 更激进合并段，减少每查询要遍历的 HNSW 图数 |
-
----
-
-## pgvector 建索引内存调优（重要）
-
-pgvector 的 **HNSW 索引构建对内存极其敏感**。构建时整个图会尽量放进
-`maintenance_work_mem`；**一旦放不下就会 spill 到磁盘，构建速度会下降一个数量级甚至更多**。
-本 demo 采用"先建空索引、随插入增量维护"的方式，插入阶段同样受此参数影响。
-
-### 关键参数
-
-| 参数 | 作用 | 建议 |
-|---|---|---|
-| `maintenance_work_mem` | 建/维护索引可用内存 | 尽量大：单次构建建议 2–8 GB（本 demo 默认 `PG_MAINTENANCE_WORK_MEM=2GB`） |
-| `max_parallel_maintenance_workers` | 并行建索引的 worker 数 | 多核实例可设 2–4，加速构建（`PG_MAX_PARALLEL_MAINT_WORKERS`） |
-| `work_mem` | 查询排序/哈希内存 | 检索并发高时适当调大 |
-| `shared_buffers` | 缓存热数据（含索引页） | 建议 ≈ 实例内存的 25% |
-
-程序会在建索引前按 `PG_MAINTENANCE_WORK_MEM` / `PG_MAX_PARALLEL_MAINT_WORKERS`
-**自动执行 `SET`（会话级）**，并打印实际生效值；权限不足时告警但不中断。
-
-### RDS 上如何设置
-
-- **会话级（本 demo 已自动做）**：`SET maintenance_work_mem = '4GB';` —— 立即生效，只影响当前连接，无需重启。
-- **实例级（更彻底）**：通过 **RDS 参数组（Parameter Group）** 修改 `maintenance_work_mem`、
-  `max_parallel_maintenance_workers`、`shared_buffers` 等，然后关联到实例。
-  注意：`maintenance_work_mem` 在 RDS 参数组里单位是 **KB**，例如 `4GB` 填 `4194304`。
-- **内存要留足**：`maintenance_work_mem × 并行 worker 数` 不能超过实例可用内存，否则可能 OOM。
-  实例内存不足时，宁可调小并行度也别让它 spill。
-
-### 经验值参考
-
-| 数据规模 | 建议 `maintenance_work_mem` | 说明 |
-|---|---|---|
-| 百万级 | 1–2 GB | 一般够用 |
-| 千万级 | 4–8 GB | 强烈建议调大，否则明显变慢 |
-| 亿级 | 8 GB+ 且配合大内存实例 | 关注 spill 与整体内存预算；必要时分区/分表 |
-
-> 小贴士：构建期间可用 `EXPLAIN` 或观察 `pg_stat_progress_create_index` 查看进度；
-> 若发现构建异常慢，多半是 `maintenance_work_mem` 不足导致 spill。
-
----
-
-## pgvector 检索性能排查（重要）
-
-若发现 pgvector 去重比对很慢，按下面顺序排查——**先测量，再优化**：
-
-### 1. 先确认检索是否真的走了 HNSW 索引
-
-程序在 `pgvector` 后端启动时会自动打印一条检索 `EXPLAIN`：
-
-```
-[diag] search plan USES HNSW index:
-       Limit ...
-         ->  Index Scan using video_vectors_embedding_idx on video_vectors ...
-```
-
-- 若显示 **`does NOT use index (!)`** 或看到 `Seq Scan`，说明每次比对在**全表顺序扫描**，
-  数据一多就会急剧变慢——这通常是 `lateral` 模式下 `ORDER BY` 关联外层向量、planner 放弃索引导致的。
-- **解决**：使用默认的 `PG_QUERY_MODE=single`（每条向量一次带绑定参数的 kNN 查询，**保证走 HNSW 索引**）。
-  `lateral` 模式仅用于 A/B 对比。
-
-### 2. 看分阶段耗时，定位真正瓶颈
-
-运行结束的结果 JSON 里有 `phase_seconds` / `phase_pct`，会告诉你时间到底花在
-**检索（search）** 还是 **写入（index_write）**：
-
-```json
-"phase_pct": { "local_dedup": 5.0, "search": 78.0, "index_write": 15.0, "refresh": 2.0 }
-```
-
-- `search` 占大头 → 走索引优化（见上）+ 降 `ef_search` + 调并发。
-- `index_write` 占大头 → "边写边查"下 HNSW **增量插入**随数据量增长变贵，属于 pgvector 的固有特性；
-  可考虑分区表、或先全量导入再建索引（但那样就不是流式去重了）。
-
-加 `--report-every-batch` 可**逐批**打印各阶段耗时，直观看出 search / write 是否随索引变大而变慢：
-
-```bash
-python run_dedup.py --backend pgvector --total 5000000 --batch-size 20000 --report-every-batch
-```
-
-```
-  batch      1 | n=20,000 | local 0.45s  search 1.20s  write 0.80s  refresh 0.00s | batch 2.45s | idx_total       13,985
-  batch     50 | n=20,000 | local 0.44s  search 3.10s  write 2.60s  refresh 0.00s | batch 6.14s | idx_total      690,102
-```
-
-> 若 `search`/`write` 明显随 `idx_total` 增长而上升，说明瓶颈是 HNSW 规模效应（检索图更深、插入更贵），
-> 而非固定开销——这对判断 pgvector 在你数据量下的可扩展性很关键。
-
-### 3. 降低 ef_search（去重不需要高精度 Top-K）
-
-去重只需判断"最近邻是否 ≤ 阈值距离"，`ef_search` 默认已从 256 降到 **128**，可再降：
-
-```bash
-export PG_HNSW_EF_SEARCH=64   # 更快，召回略降，可用准确率统计验证
-```
-
-### 4. 并发按 CPU 核数走，别盲目调高
-
-`MSEARCH_WORKERS`（默认 20）= 并发 DB 连接数 = 同时占用的 CPU 核数上限。
-**pgvector 单条 kNN 查询在单个后端进程里跑**，所以：
-
-```bash
-# 合理值 ≈ 实例 vCPU 数（留 1–2 核给写入/系统）；16 核实例设 ~12
-export MSEARCH_WORKERS=12
-```
-
-> 设过高（如 16 核开 50）不会更快，反而因抢 CPU + 连接竞争变慢，且不能超过 `max_connections`。
-
-### 5. 与 OpenSearch 的本质差异
-
-OpenSearch 的每个查询会被**分散到多个 shard/节点并行**；pgvector 单个查询只在**单实例单进程**里跑，
-只能靠客户端多连接并发。大规模、高吞吐场景这是两者的架构性差异，也是本 demo 想帮你实测量化的点。
-
----
-
-## 命令行参数
-
-| 参数 | 说明 | 默认 |
-|---|---|---|
-| `--backend` | 向量引擎：`opensearch` 或 `pgvector` | opensearch |
-| `--total` | 处理的向量总数 | 100,000,000（1 亿） |
-| `--batch-size` | 每批向量数 | 20,000 |
-| `--dup-ratio` | 注入近重复的比例 | 0.30 |
-| `--dim` | 向量维度 | 768 |
-| `--index` | 索引名 | video_vectors |
-| `--dry-run` | 跳过 OpenSearch，用真值 oracle 验证 | 关闭 |
-| `--seed` | 随机种子 | 42 |
-| `--progress-every` | 每 N 批打印一次进度 | 10 |
-| `--report-every-batch` | 每批打印分阶段耗时（local/search/write/refresh），观察是否随索引变大而变慢 | 关闭 |
-
-## 环境变量
-
-连接与调优参数集中在 `src/config.py`，可用环境变量覆盖：
-
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| `BACKEND` | 向量引擎：opensearch / pgvector | opensearch |
-| `OS_HOST` / `OS_PORT` | OpenSearch 端点 | localhost / 443 |
-| `OS_USERNAME` / `OS_PASSWORD` | Basic Auth 凭据 | 空 |
-| `OS_USE_AWS_AUTH` | 是否用 SigV4 | false |
-| `OS_AWS_REGION` / `OS_AWS_SERVICE` | SigV4 区域/服务（es 或 aoss） | us-west-2 / es |
-| `OS_INDEX` | 索引名 | video_vectors |
-| `OS_SHARDS` / `OS_REPLICAS` | 主分片 / 副本数 | 8 / 0 |
-| `OS_EF_SEARCH` | HNSW 检索候选队列（去重 top-1 用小值更快，索引级，改后需重建索引） | 32 |
-| `OS_REFRESH_INTERVAL` | 索引自动刷新周期。`-1` 禁用自动刷新，可见性完全靠每批末尾的显式 refresh，避免 search/write 期间频繁 refresh 切碎 segment | -1 |
-| `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | 段合并策略：更激进地合并成更少更大的段，减少每次 kNN 查询要遍历的 HNSW 图数量（索引级，改后需重建索引） | 20 / 5 / 50mb |
-| `BATCH_SIZE` | 批大小 | 20000 |
-| `MSEARCH_CHUNK` / `BULK_CHUNK` | 检索/写入分块大小 | 1000 / 5000 |
-| `MSEARCH_WORKERS` / `BULK_WORKERS` | 检索/写入并行度 | 20 / 4 |
-| `REFRESH_WAIT_S` | 每批后额外 sleep 秒数（显式 refresh 已同步，通常不需要） | 0 |
-| `NEAR_DUP_SIM` | 注入近重复的余弦相似度（越低越难） | 0.99 |
-| `PG_HOST` / `PG_PORT` | RDS PostgreSQL 端点 | localhost / 5432 |
-| `PG_DB` / `PG_USER` / `PG_PASSWORD` | 数据库 / 用户 / 密码 | vectordb / postgres / 空 |
-| `PG_SSLMODE` | SSL 模式（RDS 建议 require） | require |
-| `PG_TABLE` | 表名 | video_vectors |
-| `PG_HNSW_M` / `PG_HNSW_EF_CONSTRUCTION` / `PG_HNSW_EF_SEARCH` | pgvector HNSW 参数 | 16 / 128 / 128 |
-| `PG_QUERY_MODE` | 检索模式：`single`（走 HNSW 索引，默认）/ `lateral`（批量单次往返，可能不走索引） | single |
-| `PG_MAINTENANCE_WORK_MEM` | 建 HNSW 索引的内存（越大越快，见调优） | 2GB |
-| `PG_MAX_PARALLEL_MAINT_WORKERS` | 建索引并行 worker 数（0=服务器默认） | 0 |
+批次间顺序 + 显式刷新，确保每次检索都能看到此前写入的全部向量，消除并行方案的
+刷新窗口竞态导致的重复泄漏。
 
 ---
 
@@ -397,22 +146,47 @@ OpenSearch 的每个查询会被**分散到多个 shard/节点并行**；pgvecto
 | 空间类型 | `innerproduct` | 归一化后等价余弦 |
 | 去重阈值 | 余弦 ≥ 0.95 | `min_score = 1.95`（分数 = 1 + 余弦） |
 | HNSW | m=16, ef_c=128, ef_search=32（可调 `OS_EF_SEARCH`） | Faiss 引擎 |
-| 批大小 | 20,000 | 单周期 |
+| 批大小 | 20,000 | 单周期（大 batch 只拖慢本地去重） |
 | 分块 | `_msearch` 1K/块、`_bulk` 5K/块 | 规避 100MB 请求上限 |
 
 ---
 
-## 工作原理
+## 命令行参数
 
-每个批次依次执行（**批次内并行、批次间顺序**）：
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `--backend` | 向量引擎：`opensearch`（默认）或 `pgvector`（实验性） | opensearch |
+| `--total` | 处理的向量总数 | 100,000,000（1 亿） |
+| `--batch-size` | 每批向量数 | 20,000 |
+| `--dup-ratio` | 注入近重复的比例 | 0.30 |
+| `--dim` | 向量维度 | 768 |
+| `--index` | 索引名 | video_vectors |
+| `--dry-run` | 跳过集群，用真值 oracle 验证 | 关闭 |
+| `--seed` | 随机种子 | 42 |
+| `--progress-every` | 每 N 批打印一次进度 | 10 |
+| `--report-every-batch` | 每批打印分阶段耗时（local/search/write/refresh） | 关闭 |
 
-1. **本地去重**：`batch @ batch.T` 求批内两两余弦，丢弃 ≥ 0.95 的重复（精确）。
-2. **`_msearch` 径向检索**：把幸存向量对已建索引做检索，命中（余弦 ≥ 0.95）即为重复。
-3. **`_bulk` 写入**：仅写入未命中的向量。
-4. **等待刷新**：`sleep(1s)`，使本批写入对下一批可见。
+## 环境变量（OpenSearch）
 
-批次间的顺序 + 刷新等待，确保每次检索都能看到此前写入的全部向量，消除并行方案
-的刷新窗口竞态导致的重复泄漏。详见方案设计文档。
+连接与调优参数集中在 `src/config.py`，可用环境变量覆盖。**各项含义与推荐值见
+[docs/opensearch-tuning.md](docs/opensearch-tuning.md)。**
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `OS_HOST` / `OS_PORT` | OpenSearch 端点 | localhost / 443 |
+| `OS_USERNAME` / `OS_PASSWORD` | Basic Auth 凭据 | 空 |
+| `OS_USE_AWS_AUTH` | 是否用 SigV4 | false |
+| `OS_AWS_REGION` / `OS_AWS_SERVICE` | SigV4 区域/服务（es 或 aoss） | us-west-2 / es |
+| `OS_INDEX` | 索引名 | video_vectors |
+| `OS_SHARDS` / `OS_REPLICAS` | 主分片 / 副本数 | 8 / 0 |
+| `OS_EF_SEARCH` | HNSW 检索候选队列（去重 top-1 用小值更快，索引级） | 32 |
+| `OS_REFRESH_INTERVAL` | 自动刷新周期。`-1` 禁用，靠每批显式 refresh | -1 |
+| `OS_MERGE_MAX_AT_ONCE` / `OS_MERGE_SEGMENTS_PER_TIER` / `OS_MERGE_FLOOR_SEGMENT` | 段合并策略（更激进合并，索引级） | 20 / 5 / 50mb |
+| `BATCH_SIZE` | 批大小 | 20000 |
+| `MSEARCH_CHUNK` / `BULK_CHUNK` | 检索/写入分块大小 | 1000 / 5000 |
+| `MSEARCH_WORKERS` / `BULK_WORKERS` | 检索/写入并行度（按集群 vCPU 上调 workers） | 20 / 4 |
+| `REFRESH_WAIT_S` | 每批后额外 sleep 秒数（显式 refresh 已同步，通常 0） | 0 |
+| `NEAR_DUP_SIM` | 注入近重复的余弦相似度（越低越难） | 0.99 |
 
 ---
 
@@ -435,6 +209,71 @@ python -m pytest tests/ -q
 - 真实场景请把 `data_generator` 换成你的向量来源（S3 / SQS 等），其余流程不变。
 - 一次性压测任务建议 `OS_REPLICAS=0`，并把 `knn.memory.circuit_breaker.limit`
   调到 75%（程序会尝试自动设置）。
+
+---
+
+## 附录：pgvector 后端（实验性）
+
+> ⚠️ **仅作横向对比参考。** 压测显示 pgvector 在本"边写边查、索引持续增长"场景下
+> 性能不佳——单实例无法水平分片、单查询单核、增量插入随图增长变贵。适用规模
+> 大致在**低千万级、能装进单机内存**；亿级 / 十亿级请用 OpenSearch。详细原理与
+> 取舍见笔记《pgvector 边写边查去重场景调研》。
+
+### 运行
+
+先确认 RDS 实例支持 `vector` 扩展（程序会自动 `CREATE EXTENSION IF NOT EXISTS vector`，
+RDS PostgreSQL 15+ 原生支持）。
+
+```bash
+export BACKEND=pgvector
+export PG_HOST=your-instance.xxxxx.us-west-2.rds.amazonaws.com
+export PG_PORT=5432
+export PG_DB=vectordb
+export PG_USER=postgres
+export PG_PASSWORD='your-password'
+export PG_SSLMODE=require            # RDS 默认要求 SSL
+export PG_MAINTENANCE_WORK_MEM=4GB   # 建 HNSW 索引内存，越大越快
+
+python run_dedup.py --backend pgvector --total 5000000 --batch-size 20000 --report-every-batch
+```
+
+> 程序启动时会 **DROP 并重建** 目标表及其 HNSW cosine 索引，请勿指向生产表。
+> 启动时会打印一条 `EXPLAIN` 用于确认检索走了 HNSW 索引（而非 Seq Scan）。
+
+### 两种引擎对照
+
+| 维度 | OpenSearch | PostgreSQL + pgvector |
+|---|---|---|
+| 向量索引 | Faiss HNSW | pgvector HNSW |
+| 相似度 | innerproduct（`min_score=1.95`，需归一化） | cosine 距离 `<=>`（`dist <= 0.05`） |
+| 一致性 | 近实时（写入后需显式 refresh） | 事务一致（commit 后立即可见） |
+| 检索 | `_msearch` fan-out 到多分片并行 | 默认 `single`：逐条绑定参数 kNN（走 HNSW 索引），线程池并发 |
+| 写入 | `_bulk` 并行分块 | `execute_values` 批量 INSERT，线程池并发 |
+| 单查询并行 | 集群多 shard/节点并行 | 单实例单进程，靠客户端多连接并发 |
+| 水平扩展 | 加节点，近线性 | 不能分片单个 HNSW 图 |
+| 适用规模 | 亿级 ~ 十亿级 | 低千万级（单机内存内） |
+
+### pgvector 环境变量
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `PG_HOST` / `PG_PORT` | RDS 端点 | localhost / 5432 |
+| `PG_DB` / `PG_USER` / `PG_PASSWORD` | 数据库 / 用户 / 密码 | vectordb / postgres / 空 |
+| `PG_SSLMODE` | SSL 模式（RDS 建议 require） | require |
+| `PG_TABLE` | 表名 | video_vectors |
+| `PG_HNSW_M` / `PG_HNSW_EF_CONSTRUCTION` / `PG_HNSW_EF_SEARCH` | HNSW 参数 | 16 / 128 / 128 |
+| `PG_QUERY_MODE` | `single`（走索引，默认）/ `lateral`（批量单次往返，可能不走索引） | single |
+| `PG_MAINTENANCE_WORK_MEM` | 建 HNSW 索引内存（越大越快，放不下会 spill 到磁盘极慢） | 2GB |
+| `PG_MAX_PARALLEL_MAINT_WORKERS` | 建索引并行 worker 数（0=服务器默认） | 0 |
+
+### pgvector 排查要点
+
+- **检索是否走 HNSW 索引**：看启动时的 `EXPLAIN`，出现 `Seq Scan` 说明没走索引（多为 `lateral` 模式的关联 ORDER BY 导致），用默认 `single` 模式。
+- **建索引内存**：`maintenance_work_mem` 放不下图就 spill 到磁盘、慢一个数量级；千万级建议 4–8GB。RDS 参数组里单位是 KB（`4GB` 填 `4194304`）。
+- **并发按 CPU 核数**：`MSEARCH_WORKERS` = 并发连接数 = 占用核数上限；pgvector 单查询单核，设过高（超 vCPU / `max_connections`）反而更慢。
+- **降 ef_search**：去重 top-1，`PG_HNSW_EF_SEARCH=64` 更快，用准确率验证召回。
+
+---
 
 ## License
 
