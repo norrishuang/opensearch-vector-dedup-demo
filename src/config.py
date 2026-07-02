@@ -39,30 +39,31 @@ class Config:
     # accuracy stats show missed near-duplicates.
     hnsw_ef_search: int = int(os.getenv("OS_EF_SEARCH", "32"))
     # mmap-based vector search instead of loading the full HNSW graph into
-    # the JVM heap / off-heap native memory. Lets the OS page cache manage
-    # vector data, which can help when many segments exist (our refresh-
-    # heavy workload keeps producing new segments before merge catches up).
+    # off-heap native memory. Lets the OS page cache manage vector data, so
+    # search latency no longer degrades as segment count grows (validated:
+    # search stayed flat at ~2.6-3.1s from 0 to 2M+ indexed rows, vs the old
+    # behavior of climbing to 8s+). Requires OpenSearch 3.1+ and an index
+    # created on OpenSearch 2.19+; falls back to full in-memory loading
+    # otherwise (safe to leave enabled on older clusters).
     knn_memory_optimized_search: bool = (
-        os.getenv("OS_KNN_MEMORY_OPTIMIZED_SEARCH", "false").lower() == "true")
+        os.getenv("OS_KNN_MEMORY_OPTIMIZED_SEARCH", "true").lower() == "true")
     number_of_shards: int = int(os.getenv("OS_SHARDS", "8"))
     number_of_replicas: int = int(os.getenv("OS_REPLICAS", "0"))
-    # Merge policy: fewer, larger segments -> faster kNN search (each segment
-    # holds an independent HNSW graph, so fewer segments = fewer graphs to
-    # traverse per query). NOTE: too aggressive (e.g. segments_per_tier=5)
-    # makes the synchronous per-batch refresh block on large merges (refresh
-    # observed at ~10s). These values balance segment count vs refresh cost.
+    # Merge policy: kept at OpenSearch defaults. We previously tuned these
+    # more aggressively (segments_per_tier=5-10, max_thread_count=4,
+    # max_merged_segment=1gb) to minimize segment count for faster search.
+    # With knn_memory_optimized_search enabled, search no longer depends on
+    # segment count, so aggressive merging is unnecessary -- and was in fact
+    # counterproductive: it could make background merges fall behind the
+    # write rate and trigger OpenSearch's auto_throttle, which blocks the
+    # synchronous per-batch index.refresh() (observed refresh spikes of
+    # ~10s). Defaults below avoid that: 60+ batches with 0 refresh spikes.
     merge_max_at_once: int = int(os.getenv("OS_MERGE_MAX_AT_ONCE", "10"))
     merge_segments_per_tier: int = int(os.getenv("OS_MERGE_SEGMENTS_PER_TIER", "10"))
-    merge_floor_segment: str = os.getenv("OS_MERGE_FLOOR_SEGMENT", "50mb")
-    # Root cause of refresh blocking: default merge.scheduler.max_thread_count=1
-    # means merges run on a single thread per shard. When merge falls behind
-    # our write rate, OpenSearch's auto_throttle kicks in and throttles disk
-    # IO for writes/refresh to let merge catch up (observed via
-    # merge.total_throttled_time_in_millis). More merge threads + a smaller
-    # merge target size avoids triggering throttle in the first place.
+    merge_floor_segment: str = os.getenv("OS_MERGE_FLOOR_SEGMENT", "2mb")
     merge_scheduler_max_thread_count: int = int(
-        os.getenv("OS_MERGE_SCHEDULER_MAX_THREAD_COUNT", "4"))
-    merge_max_merged_segment: str = os.getenv("OS_MERGE_MAX_MERGED_SEGMENT", "1gb")
+        os.getenv("OS_MERGE_SCHEDULER_MAX_THREAD_COUNT", "1"))
+    merge_max_merged_segment: str = os.getenv("OS_MERGE_MAX_MERGED_SEGMENT", "5gb")
     # "-1" disables periodic auto-refresh: visibility is driven solely by the
     # explicit index.refresh() at the end of each batch. This avoids the ~1
     # refresh/sec firing during search+write (each auto-refresh cuts a new
