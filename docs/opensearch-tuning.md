@@ -74,7 +74,24 @@ HNSW 图越多。`memory_optimized_search` 让 Faiss 引擎通过内存映射（
 
 ---
 
-## 4. 客户端 JSON 序列化用 orjson 替代标准库
+## 4. 批量写入（_bulk）同样要用 orjson，不要依赖客户端库的默认序列化器
+
+**参数**：无需额外环境变量，代码已内置。确保 `orjson` 已安装（见第 5 节）。
+
+**好处**：`opensearch-py` 的 `helpers.bulk()` 默认使用其内置的标准 `json` 序列化器，
+**不会**自动使用已安装的 `orjson`。之前的实现依赖 `helpers.bulk()` 处理请求体拼接，
+导致写入路径完全没有享受到 orjson 的加速——每条 768 维向量的写入依然是纯 Python
+`json.dumps`，与 search 路径优化前的瓶颈完全相同。
+
+改为手工拼接 `_bulk` 请求体（NDJSON 格式，`{"index": {...}}` + 文档逐行），复用
+第 5 节的 `_fast_dumps` 直接调用 `client.bulk()`，绕开 `helpers.bulk()` 的默认序列化器。
+
+**实测提升**：write 阶段耗时从 ~12-14s/批（40K 向量）降到 ~2-2.5s/批，约 **6 倍**，
+是目前所有单项优化中收益最大的一项。
+
+---
+
+## 5. 客户端 JSON 序列化用 orjson 替代标准库
 
 **参数**：
 ```bash
@@ -90,7 +107,7 @@ export MSEARCH_WORKERS=64   # 按集群 vCPU 规模上调
 
 ---
 
-## 5. 检索并发要匹配集群规模
+## 6. 检索并发要匹配集群规模
 
 **参数**：
 ```bash
@@ -105,7 +122,7 @@ export BULK_CHUNK=5000
 
 ---
 
-## 6. 参数汇总
+## 7. 参数汇总
 
 | 参数 | 建议值 | 好处 |
 |---|---|---|
@@ -115,7 +132,7 @@ export BULK_CHUNK=5000
 | `OS_KNN_MEMORY_OPTIMIZED_SEARCH` | `true`（需 3.1+） | mmap 访问索引，search 不再随 segment 数增长而变慢 |
 | 段合并相关参数 | 保持 OpenSearch 默认值 | 过激进的合并目标会触发磁盘 IO 限流，拖慢 refresh |
 | `BATCH_SIZE` | `20000-40000` | 按客户端算力权衡；越大本地去重越慢 |
-| `orjson` | 安装后自动启用 | 客户端序列化提速 5-10× |
+| `orjson` | 安装后自动启用（search + bulk write 均已接入） | 客户端序列化提速 5-10×；write 阶段实测提速 ~6× |
 | `MSEARCH_CHUNK` | `500` | 配合 orjson 提高并行粒度 |
 | `MSEARCH_WORKERS` | `64`（按集群 vCPU 调整） | 打满集群检索并发 |
 | `BULK_CHUNK` / `BULK_WORKERS` | `5000` / `8` | 并行写入吞吐 |
@@ -123,3 +140,17 @@ export BULK_CHUNK=5000
 > `OS_EF_SEARCH` / `OS_KNN_MEMORY_OPTIMIZED_SEARCH` 为索引级设置，改动后需重建索引才生效。
 > `MSEARCH_CHUNK` / `MSEARCH_WORKERS` / `BULK_CHUNK` / `BULK_WORKERS` / `BATCH_SIZE` /
 > `orjson` 为客户端/运行时参数，可随时调整无需重建索引。
+
+**当前性能最优配置（10M 测试实测吞吐 ~4,000+ vec/s）**：
+```bash
+export OS_SHARDS=16
+export OS_EF_SEARCH=32
+export OS_KNN_MEMORY_OPTIMIZED_SEARCH=true
+export MSEARCH_WORKERS=64
+export MSEARCH_CHUNK=500
+export BULK_CHUNK=5000
+export BULK_WORKERS=8
+export BATCH_SIZE=40000
+# 段合并策略保持默认，无需设置 OS_MERGE_* 相关变量
+pip install orjson>=3.9.0
+```
